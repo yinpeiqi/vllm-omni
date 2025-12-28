@@ -63,7 +63,7 @@ class Omni:
         *args: Variable length argument list.
             - args[0]: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model (str): Model name or path to load (if not in args).
+            - model: Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging

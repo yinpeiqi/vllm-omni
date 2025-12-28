@@ -75,9 +75,9 @@ class AsyncOmni:
 
     Args:
         *args: Variable length argument list.
-            - args[0] (str): Model name or path to load.
+            - args[0]: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model (str): Model name or path to load (if not in args).
+            - model: Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
@@ -214,7 +214,6 @@ class AsyncOmni:
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
 
-        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[AsyncOrchestrator] Loaded %d stages", len(self.stage_list))
 
@@ -385,7 +384,6 @@ class AsyncOmni:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
-        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
