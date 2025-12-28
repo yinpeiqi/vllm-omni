@@ -10,7 +10,6 @@ from dataclasses import asdict
 from pprint import pformat
 from typing import Any
 
-import msgspec
 from omegaconf import OmegaConf
 from vllm.config import VllmConfig
 from vllm.inputs.preprocess import InputPreprocessor
@@ -213,6 +212,7 @@ class AsyncOmni:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
 
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[AsyncOrchestrator] Loaded %d stages", len(self.stage_list))
@@ -384,6 +384,7 @@ class AsyncOmni:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
@@ -534,22 +535,24 @@ class AsyncOmni:
         # TODO: lora_request, trace_headers, priority are not supported yet
 
         if sampling_params_list is None:
+            # For Omni LLM, the params are parsed via the yaml file. For the current version,
+            # diffusion params can parsed via the command line.
             omni_params_kwargs = {
                 k: v for k, v in kwargs.items() if k not in ["prompt", "request_id", "output_modalities"]
             }
 
             per_stage_params: list[Any] = []
-            for stage in self.stage_list:
+            for stage_id, stage in enumerate(self.stage_list):
                 stage_type = getattr(stage, "stage_type", "llm")
-                default_dict = msgspec.to_builtins(getattr(stage, "default_sampling_params", {}))
-                # Merge user-provided kwargs
-                merged = {**default_dict, **omni_params_kwargs}
                 if stage_type == "diffusion":
+                    default_dict = self.default_sampling_params_list[stage_id]
+                    # Merge user-provided kwargs
+                    merged = {**default_dict, **omni_params_kwargs}
                     # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
                     per_stage_params.append(merged)
                 else:
-                    # LLM directly constructs SamplingParams
-                    per_stage_params.append(SamplingParams(**merged))
+                    # LLM directly constructs SamplingParams, don't use the merged params
+                    per_stage_params.append(self.default_sampling_params_list[stage_id])
 
             sampling_params_list = per_stage_params
 
