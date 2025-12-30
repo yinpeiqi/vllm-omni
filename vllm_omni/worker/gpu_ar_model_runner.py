@@ -181,7 +181,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 dtype=np.int32,
             )
             # Merged preprocess and model forward
-            model_output, update_dicts = self._preprocess_and_model_forward(
+            model_output, update_dicts = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
@@ -463,7 +463,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         return async_output
 
 
-    def _preprocess_and_model_forward(
+    def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
