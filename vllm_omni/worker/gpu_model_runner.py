@@ -36,7 +36,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().__init__(*args, **kwargs)
         self._omni_per_req_additional_information: dict[str, dict] | None = None
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
-        self._omni_last_model_output: object | None = None
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -640,22 +639,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         except Exception as e:
             logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
 
-    def _gather_runtime_additional_information(self) -> list[dict]:
-        """Gather per-request additional_information stored in request state in batch order."""
-        per_req_runtime_info = []
-        for req_id in self.input_batch.req_ids:
-            req_state = self.requests.get(req_id)
-            info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-            if info and isinstance(info, dict):
-                per_req_runtime_info.append(info)
-                if "thinker_reply_part_per_request" in info:
-                    q = info["thinker_reply_part_per_request"]
-                    if hasattr(q, "shape"):
-                        logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
-            else:
-                per_req_runtime_info.append({})
-        return per_req_runtime_info
-
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
         """Compute (start, end) token spans for each request within the flattened step sequence."""
         req_token_spans: list[tuple[int, int]] = []
@@ -664,20 +647,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             sched_tokens = int(num_scheduled_tokens_np[req_index])
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
-
-    def _build_model_kwargs_extra(self) -> dict:
-        """Build extra keyword arguments passed to the model for this step, including:
-        - runtime_additional_information: per-request additional information stored in request state
-        """
-        model_kwargs_extra: dict[str, object] = {}
-        try:
-            model_kwargs_extra["runtime_additional_information"] = self._gather_runtime_additional_information()
-        except Exception as e:
-            logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
-            import traceback
-
-            traceback.print_exc()
-        return model_kwargs_extra
 
     def _process_additional_information_updates(
         self,
@@ -846,31 +815,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Prefill: overlay prompt_embeds and collect additional_information
             self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
 
-        if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
-            # Overlay custom prompt_embeds per request for the prompt portion;
-            # collect additional_information (tensor/list) for prefill portion only
-            for req_index, req_id in enumerate(self.input_batch.req_ids):
-                req_state = self.requests.get(req_id)
-                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-
-                start_offset = int(self.query_start_loc.cpu[req_index])
-                sched_tokens = int(num_scheduled_tokens_np[req_index])
-                s, e = start_offset, start_offset + sched_tokens
-                span_len = int(e) - int(s)
-
-                # call the custom process function
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
-                )
-                # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
-
-                # update the inputs_embeds and input_ids
-                seg_len = min(span_len, req_embeds.shape[0])
-                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    input_ids[s : s + seg_len] = req_input_ids
-
         return (
             input_ids,
             inputs_embeds,
@@ -880,33 +824,39 @@ class OmniGPUModelRunner(GPUModelRunner):
             ec_connector_output,
         )
 
-    def _model_forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
-    ):
-        """Inject omni-specific kwargs into forward and cache model output"""
-        model_kwargs_extra = self._build_model_kwargs_extra()
+    def update_model_output_and_merge_additional_information(
+        self, model_output: OmniOutput, update_dicts: dict) -> OmniOutput:
+        """Update model output and merge additional information"""
+        if update_dicts:
+            # Merge preprocess update dicts
+            has_mm_outputs = False
+            # check if request has multimodal outputs
+            for req_id, update_dict in update_dicts.items():
+                self._merge_additional_information_update(req_id, update_dict)
+                if update_dict.get("multimodal_outputs", False):
+                    has_mm_outputs = True
+            if has_mm_outputs:
+                # append multimodal outputs to model output
+                multimodal_outputs = {}
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_state = self.requests.get(req_id)
+                    update_dict = update_dicts[req_id]
+                    # This is a dict of {output_name: output_tensor}
+                    for mm_output_name, mm_output in update_dict["multimodal_outputs"].items():
+                        if mm_output_name not in multimodal_outputs:
+                            multimodal_outputs[mm_output_name] = []
+                        multimodal_outputs[mm_output_name].append(mm_output)
+                    update_dict.pop("multimodal_outputs")
 
-        runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
-        if runtime_info:
-            for i, info in enumerate(runtime_info):
-                if info:
-                    logger.debug(f"[OMNI] req[{i}] runtime_additional_information keys: {list(info.keys())}")
-
-        model_output = super()._model_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-            **model_kwargs_extra,
-        )
-        # Cache model output so later sample_tokens can consume multimodal results.
-        self._omni_last_model_output = model_output
+                for mm_output_name, mm_output_list in multimodal_outputs.items():
+                    # TODO: For now, we assume the multimodal outputs are tensors and have the same shape.
+                    multimodal_outputs[mm_output_name] = torch.cat(mm_output_list, dim=0)
+                model_output = model_output._replace(multimodal_outputs=multimodal_outputs)
+                # reset the model output
+                self._omni_last_model_output = model_output
+            # merge additional information
+            for req_id, update_dict in update_dicts.items():
+                self._merge_additional_information_update(req_id, update_dict)
         return model_output
 
     def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:

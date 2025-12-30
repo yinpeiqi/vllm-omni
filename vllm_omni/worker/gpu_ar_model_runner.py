@@ -174,16 +174,28 @@ class GPUARModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_output = self._model_forward(
+
+            req_ids = self.input_batch.req_ids
+            num_scheduled_tokens_np = np.array(
+                [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
+                dtype=np.int32,
+            )
+            # Merged preprocess and model forward
+            model_output, update_dicts = self._preprocess_and_model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
                 **model_kwargs,
                 sampling_metadata=self.input_batch.sampling_metadata,
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+
+            # Merge preprocess update dicts
+            if update_dicts:
+                model_output = self.update_model_output_and_merge_additional_information(model_output, update_dicts)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -449,3 +461,52 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
 
         return async_output
+
+
+    def _preprocess_and_model_forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        num_scheduled_tokens_np: np.ndarray | None = None,
+        **model_kwargs: dict[str, Any],
+    ):
+        """Inject omni-specific kwargs into forward and cache model output"""
+        preprocess_update_dicts = {}
+        # we move the preprocess logic here.
+        if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
+            # Overlay custom prompt_embeds per request for the prompt portion;
+            # collect additional_information (tensor/list) for prefill portion only
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_state = self.requests.get(req_id)
+                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+
+                start_offset = int(self.query_start_loc.cpu[req_index])
+                # Should be one during decode. Feasible for CUDA graph.
+                sched_tokens = int(num_scheduled_tokens_np[req_index])
+                s, e = start_offset, start_offset + sched_tokens
+                span_len = int(e) - int(s)
+
+                # call the custom process function
+                req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                    input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
+                )
+                # Here we store the update_dict for each request, but merge it outside forward pass.
+                preprocess_update_dicts[req_id] = update_dict
+
+                # update the inputs_embeds and input_ids
+                seg_len = min(span_len, req_embeds.shape[0])
+                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                # Usually input_ids are not used in the forward pass when input_embeds are used.
+                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                    input_ids[s : s + seg_len] = req_input_ids
+
+        model_output = super()._model_forward(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
+        )
+        return model_output, preprocess_update_dicts
