@@ -174,7 +174,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-
             req_ids = self.input_batch.req_ids
             num_scheduled_tokens_np = np.array(
                 [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
@@ -461,7 +460,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
 
         return async_output
-
 
     def _model_forward(
         self,

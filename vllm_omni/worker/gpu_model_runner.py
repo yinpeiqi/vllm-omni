@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -825,7 +825,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     def update_model_output_and_merge_additional_information(
-        self, model_output: OmniOutput, update_dicts: dict) -> OmniOutput:
+        self, model_output: OmniOutput, update_dicts: dict
+    ) -> OmniOutput:
         """Update model output and merge additional information"""
         if update_dicts:
             # Merge preprocess update dicts
@@ -839,7 +840,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # append multimodal outputs to model output
                 multimodal_outputs = {}
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
-                    req_state = self.requests.get(req_id)
                     update_dict = update_dicts[req_id]
                     # This is a dict of {output_name: output_tensor}
                     for mm_output_name, mm_output in update_dict["multimodal_outputs"].items():
