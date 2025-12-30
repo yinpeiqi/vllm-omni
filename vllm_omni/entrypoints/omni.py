@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import multiprocessing as mp
 import os
 import time
 import uuid
+import weakref
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -39,6 +41,22 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
+    """Weak reference cleanup function for OmniBase instances."""
+    if stage_list:
+        for q in stage_in_queues:
+            try:
+                q.put_nowait(None)
+            except Exception as e:
+                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+        for stage in stage_list:
+            try:
+                stage.stop_stage_worker()
+            except Exception as e:
+                logger.warning(f"Failed to stop stage worker: {e}")
+    try_close_ray(ray_pg)
+
+
 def _dummy_snapshot_download(model_id):
     return model_id
 
@@ -66,8 +84,9 @@ class OmniBase:
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
-            - init_sleep_seconds: Number of seconds to sleep between starting
-              each stage process during initialization
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
@@ -101,6 +120,36 @@ class OmniBase:
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
+    def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
+        if cache_backend == "cache_dit":
+            return {
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+                "enable_taylorseer": False,
+                "taylorseer_order": 1,
+                "scm_steps_mask_policy": None,
+                "scm_steps_policy": "dynamic",
+            }
+        if cache_backend == "tea_cache":
+            return {
+                "rel_l1_thresh": 0.2,
+            }
+        return None
+
+    def _normalize_cache_config(self, cache_backend: str | None, cache_config: Any | None) -> Any | None:
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid cache_config JSON, using defaults.")
+                cache_config = None
+        if cache_config is None and cache_backend not in (None, "", "none"):
+            cache_config = self._get_default_cache_config(cache_backend)
+        return cache_config
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # We temporally create a default config for diffusion stage.
@@ -108,6 +157,8 @@ class OmniBase:
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
         if "dtype" in kwargs:
             kwargs["dtype"] = str(kwargs["dtype"])
+        cache_backend = kwargs.get("cache_backend", "none")
+        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
         # TODO: hack, calculate devices based on parallel config.
         devices = "0"
         if "parallel_config" in kwargs:
@@ -123,7 +174,13 @@ class OmniBase:
                     "devices": devices,
                     "max_batch_size": 1,
                 },
-                "engine_args": OmegaConf.create(kwargs),
+                "engine_args": OmegaConf.create(
+                    {
+                        **kwargs,
+                        "cache_backend": cache_backend,
+                        "cache_config": cache_config,
+                    }
+                ),
                 "final_output": True,
                 "final_output_type": "image",
             }
@@ -133,7 +190,7 @@ class OmniBase:
 
     def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
         """Initialize stage list management."""
-        init_sleep_seconds = kwargs.get("init_sleep_seconds", 20)
+        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
         shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
         init_timeout = kwargs.get("init_timeout", 300)
         worker_backend = kwargs.get("worker_backend", "multi_process")
@@ -168,7 +225,7 @@ class OmniBase:
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
             idx, cfg = idx_cfg
-            return idx, OmniStage(cfg)
+            return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
 
         with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
             futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
@@ -187,7 +244,7 @@ class OmniBase:
             self._ctx = mp.get_context("spawn")
             self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
 
-        self._init_sleep_seconds = max(0, int(init_sleep_seconds))
+        self._stage_init_timeout = max(0, int(stage_init_timeout))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stages(model)
         # Wait for all stages to report readiness before seeding
@@ -225,7 +282,6 @@ class OmniBase:
             )
 
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
-            time.sleep(self._init_sleep_seconds)
 
     def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
         self._stages_ready.add(stage_id)
@@ -261,7 +317,7 @@ class OmniBase:
                         "Verify GPU/device assignment in config (runtime.devices) is correct.",
                         "Check GPU/host memory availability; reduce model or batch size if needed.",
                         "Check model weights path and network reachability (if loading remotely).",
-                        "Increase initialization wait time (init_sleep_seconds or call-site timeout).",
+                        "Increase initialization wait time (stage_init_timeout or call-site timeout).",
                     ]
                 )
                 logger.error(
@@ -277,28 +333,8 @@ class OmniBase:
 
     def close(self) -> None:
         """Close all stage processes and clean up resources."""
-        # Close stages if they exist (for LLM models)
-        if self.stage_list:
-            for q in self._stage_in_queues:
-                try:
-                    q.put_nowait(None)
-                except Exception as e:
-                    logger.warning(
-                        f"[{self._name}] Failed to send shutdown signal to stage input queue: {e}",
-                    )
-            for stage in self.stage_list:
-                try:
-                    stage.stop_stage_worker()
-                except Exception as e:
-                    logger.warning(f"[{self._name}] Failed to stop stage worker: {e}")
-
-            try_close_ray(self._ray_pg)
-
-    def __del__(self):  # pragma: no cover - best effort cleanup
-        try:
-            self.close()
-        except Exception:
-            logger.debug(f"[{self._name}] __del__ close() raised", exc_info=True)
+        if hasattr(self, "_weak_finalizer"):
+            self._weak_finalizer()
 
     @property
     def _name(self) -> str:
@@ -321,8 +357,9 @@ class Omni(OmniBase):
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
-            - init_sleep_seconds: Number of seconds to sleep between starting
-              each stage process during initialization
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
@@ -339,6 +376,15 @@ class Omni(OmniBase):
 
     def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
         super().__init__(*args, **kwargs)
+
+        # Register weak reference cleanup (called on garbage collection)
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_cleanup,
+            self.stage_list,
+            self._stage_in_queues,
+            self._ray_pg,
+        )
 
     def generate(self, *args: Any, **kwargs: dict[str, Any]) -> list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
@@ -390,7 +436,13 @@ class Omni(OmniBase):
                     per_stage_params.append(self.default_sampling_params_list[stage_id])
 
             sampling_params_list = per_stage_params
-        return self._run_generation(prompts, sampling_params_list)
+        try:
+            return self._run_generation(prompts, sampling_params_list)
+        except Exception as e:
+            logger.exception("[Orchestrator] Failed to run generation: %s", e)
+            raise e
+        finally:
+            self.close()
 
     def _run_generation(
         self,

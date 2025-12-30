@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import time
+import weakref
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import asdict
 from pprint import pformat
@@ -20,6 +21,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.log_utils import (
@@ -34,6 +36,25 @@ from vllm_omni.entrypoints.utils import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handler):
+    """Weak reference cleanup function for AsyncOmni instances."""
+    if stage_list:
+        for q in stage_in_queues:
+            try:
+                q.put_nowait(None)
+            except Exception as e:
+                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+        for stage in stage_list:
+            try:
+                stage.stop_stage_worker()
+            except Exception as e:
+                logger.warning(f"Failed to stop stage worker: {e}")
+    try_close_ray(ray_pg)
+    # Cancel output handler
+    if output_handler is not None:
+        output_handler.cancel()
 
 
 class AsyncOmni(OmniBase):
@@ -51,8 +72,9 @@ class AsyncOmni(OmniBase):
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
-            - init_sleep_seconds: Number of seconds to sleep between starting
-              each stage process during initialization
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
@@ -82,9 +104,22 @@ class AsyncOmni(OmniBase):
 
         super().__init__(*args, **kwargs)
 
+        # Register weak reference cleanup (called on garbage collection)
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_cleanup_async,
+            self.stage_list,
+            self._stage_in_queues,
+            self._ray_pg,
+            self.output_handler,
+        )
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # TODO: here is different from the Omni class. We should merge the two in the future.
+        cache_backend = kwargs.get("cache_backend", "none")
+        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+
         devices = "0"
         if "parallel_config" in kwargs:
             parallel_config = kwargs["parallel_config"]
@@ -92,13 +127,21 @@ class AsyncOmni(OmniBase):
             for i in range(1, num_devices):
                 devices += f",{i}"
         else:
+            ulysses_degree = kwargs.get("ulysses_degree") or 1
+            ring_degree = kwargs.get("ring_degree") or 1
+            sequence_parallel_size = kwargs.get("sequence_parallel_size")
+            if sequence_parallel_size is None:
+                sequence_parallel_size = ulysses_degree * ring_degree
+            num_devices = sequence_parallel_size
+            for i in range(1, num_devices):
+                devices += f",{i}"
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
                 tensor_parallel_size=1,
-                sequence_parallel_size=1,
-                ulysses_degree=1,
-                ring_degree=1,
+                sequence_parallel_size=sequence_parallel_size,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
                 cfg_parallel_size=1,
             )
         default_stage_cfg = [
@@ -114,8 +157,8 @@ class AsyncOmni(OmniBase):
                     "parallel_config": parallel_config,
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                    "cache_backend": kwargs.get("cache_backend", "none"),
-                    "cache_config": kwargs.get("cache_config", None),
+                    "cache_backend": cache_backend,
+                    "cache_config": cache_config,
                 },
                 "final_output": True,
                 "final_output_type": "image",
@@ -175,23 +218,14 @@ class AsyncOmni(OmniBase):
             self.io_processor = None
             self.model_config = None
 
-    def close(self) -> None:
-        """Close all stage processes and clean up resources."""
-        if self.output_handler is not None:
-            self.output_handler.cancel()
-            self.output_handler = None
-        super().close()
-
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
 
         Alias for close() method. Cleans up all stage processes
         and inter-process communication resources.
         """
-        try:
-            self.close()
-        except Exception as e:
-            logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
+        if hasattr(self, "_weak_finalizer"):
+            self._weak_finalizer()
 
     async def generate(self, *args: Any, **kwargs: dict[str, Any]) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
