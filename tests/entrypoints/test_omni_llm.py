@@ -3,6 +3,7 @@ import warnings
 from queue import Empty, Queue
 from typing import Any
 from unittest.mock import MagicMock
+from dataclasses import dataclass
 
 import pytest
 from vllm.sampling_params import SamplingParams
@@ -45,6 +46,10 @@ class _FakeStageConfig:
         # Store original dict for reference
         self._config_dict = config_dict
 
+@dataclass
+class _FakeStageMetrics:
+    num_tokens_out: int
+    stage_gen_time_ms: float
 
 class _FakeQueue:
     """Fake queue using standard library Queue to replace mp.Queue."""
@@ -624,7 +629,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageMetrics(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     # Stage 1 output (will be collected after stage 0 forwards to it)
@@ -636,7 +641,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1, "text": "s1"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageMetrics(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -714,14 +719,14 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageMetrics(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageMetrics(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -788,14 +793,14 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageMetrics(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageMetrics(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     # Use the default sampling params
@@ -920,7 +925,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "result"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageMetrics(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -932,6 +937,69 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     assert isinstance(outputs, list)
     # Since final_output=True, should have one output
     assert len(outputs) == 1
+
+
+def test_generate_reaches_error_tolerance_limit(monkeypatch, fake_stage_config):
+    """Test that generate reaches error tolerance limit and raises an exception."""
+
+    def _fake_loader(model: str):
+        return [_FakeStageConfig(fake_stage_config)]
+
+    import sys
+
+    for module_name in [
+        "vllm_omni.entrypoints.utils",
+        "vllm_omni.entrypoints.omni",
+        "vllm_omni.entrypoints.omni_stage",
+    ]:
+        if module_name in sys.modules:
+            del sys.modules[module_name]
+
+    _setup_engine_mocks(monkeypatch)
+    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_ipc_mocks(monkeypatch)
+    _setup_log_mocks(monkeypatch)
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        _fake_loader,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni_stage.OmniStage",
+        lambda cfg: _FakeStage(cfg),
+        raising=False,
+    )
+
+    import vllm_omni.entrypoints.omni as omni_module
+
+    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg: _FakeStage(cfg))
+
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_module, "uuid", uuid)
+
+    from vllm_omni.entrypoints.omni import Omni
+
+    omni = Omni(model="any", init_timeout=1)
+
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
+
+    # Put three errors in output queue
+    for i in range(3):
+        omni.stage_list[0]._out_q.put_nowait(
+            {
+                "request_id": expected_request_id,
+                "error": "test error",
+            }
+        )
+
+    sampling_params_list = [{"temperature": 0.7}]
+    with pytest.raises(RuntimeError):
+        outputs = omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
 
 
 def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
