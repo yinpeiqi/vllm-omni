@@ -1,9 +1,9 @@
 import uuid
 import warnings
+from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any
 from unittest.mock import MagicMock
-from dataclasses import dataclass
 
 import pytest
 from vllm.sampling_params import SamplingParams
@@ -46,10 +46,12 @@ class _FakeStageConfig:
         # Store original dict for reference
         self._config_dict = config_dict
 
+
 @dataclass
 class _FakeStageMetrics:
     num_tokens_out: int
     stage_gen_time_ms: float
+
 
 class _FakeQueue:
     """Fake queue using standard library Queue to replace mp.Queue."""
@@ -999,7 +1001,7 @@ def test_generate_reaches_error_tolerance_limit(monkeypatch, fake_stage_config):
 
     sampling_params_list = [{"temperature": 0.7}]
     with pytest.raises(RuntimeError):
-        outputs = omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
+        omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
 
 
 def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
