@@ -1,6 +1,6 @@
 # Text-To-Image
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
+This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
@@ -13,7 +13,8 @@ from vllm_omni.entrypoints.omni import Omni
 if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
-    images = omni.generate(prompt)
+    outputs = omni.generate(prompt)
+    images = outputs[0].request_output[0]["images"]
     images[0].save("coffee.png")
 ```
 
