@@ -8,7 +8,6 @@ import asyncio
 import gc
 import os
 import signal
-import time
 
 import torch
 from vllm.third_party.pynvml import (
