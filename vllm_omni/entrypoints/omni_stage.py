@@ -41,6 +41,7 @@ from vllm_omni.entrypoints.stage_utils import (
     SHUTDOWN_TASK,
     OmniStageTaskType,
     _to_dict,
+    is_profiler_task,
     maybe_dump_to_shm,
     set_stage_devices,
 )
@@ -600,11 +601,38 @@ def _stage_worker(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
                 pass
     logger.debug("Engine initialized")
+
+    # Check if stage engine supports profiling (via vLLM's built-in profiler)
+    has_profiler = hasattr(stage_engine, "start_profile") and hasattr(stage_engine, "stop_profile")
+    if has_profiler:
+        logger.info(
+            "[Stage-%s] vLLM profiler support detected (model_stage=%s)",
+            stage_id,
+            engine_args.get("model_stage", None),
+        )
+
+    def handle_profiler_task(task_type: OmniStageTaskType) -> None:
+        """Handle profiler task."""
+        if task_type == OmniStageTaskType.PROFILER_START:
+            if has_profiler:
+                try:
+                    stage_engine.start_profile()
+                    logger.info("[Stage-%s] Profiler started via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to start profiler: %s", stage_id, e)
+        elif task_type == OmniStageTaskType.PROFILER_STOP:
+            if has_profiler:
+                try:
+                    stage_engine.stop_profile()
+                    logger.info("[Stage-%s] Profiler stopped via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to stop profiler: %s", stage_id, e)
 
     # Initialize OmniConnectors if configured
     connectors = {}
@@ -633,8 +661,13 @@ def _stage_worker(
         _recv_dequeue_ts = _time.time()
         task_type = task.get("type", OmniStageTaskType.GENERATE)
         if task_type == OmniStageTaskType.SHUTDOWN:
-            logger.error("Received shutdown signal")
+            logger.info("Received shutdown signal")
             break
+
+        # Handle profiler control commands
+        if is_profiler_task(task_type):
+            handle_profiler_task(task_type)
+            continue
 
         batch_tasks: list[dict[str, Any]] = [task]
         start_time = _time.time()
@@ -645,6 +678,11 @@ def _stage_worker(
                     if extra == SHUTDOWN_TASK:
                         in_q.put(SHUTDOWN_TASK)
                         break
+                    # Handle profiler commands that arrive during batching
+                    extra_type = extra.get("type") if isinstance(extra, dict) else None
+                    if is_profiler_task(extra_type):
+                        handle_profiler_task(extra_type)
+                        continue  # Don't add to batch_tasks
                     batch_tasks.append(extra)
                     end_time = _time.time()
                     duration = end_time - start_time
@@ -1067,6 +1105,7 @@ async def _stage_worker_async(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
@@ -1076,6 +1115,33 @@ async def _stage_worker_async(
     if stage_type != "diffusion":
         await stage_engine.reset_mm_cache()
     logger.debug("[Stage-%s] Engine initialized", stage_id)
+
+    # Check if stage engine supports profiling (via vLLM's built-in profiler)
+    has_profiler = hasattr(stage_engine, "start_profile") and hasattr(stage_engine, "stop_profile")
+    if has_profiler:
+        logger.info(
+            "[Stage-%s] vLLM profiler support detected for async stage (model_stage=%s)",
+            stage_id,
+            engine_args.get("model_stage", None),
+        )
+
+    async def handle_profiler_task_async(task_type: OmniStageTaskType) -> None:
+        """Handle profiler task asynchronously."""
+        if task_type == OmniStageTaskType.PROFILER_START:
+            if has_profiler:
+                try:
+                    await stage_engine.start_profile()
+                    logger.info("[Stage-%s] Profiler started via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to start profiler: %s", stage_id, e)
+        elif task_type == OmniStageTaskType.PROFILER_STOP:
+            if has_profiler:
+                try:
+                    await stage_engine.stop_profile()
+                    logger.info("[Stage-%s] Profiler stopped via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to stop profiler: %s", stage_id, e)
+
     # Signal readiness to orchestrator and send vllm_config back to main process
     try:
         # Send vllm_config back to main process so it can be accessed via
@@ -1160,6 +1226,7 @@ async def _stage_worker_async(
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                    _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
@@ -1183,8 +1250,11 @@ async def _stage_worker_async(
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
+            elif is_profiler_task(task_type):
+                await handle_profiler_task_async(task_type)
             else:
                 asyncio.create_task(generation_single_request(task))
+
         except queue.Empty:
             await asyncio.sleep(0.001)
         batch_request_outputs: list[Any] = []
@@ -1269,6 +1339,19 @@ async def _stage_worker_async(
     logger.info("Stage worker exiting")
 
 
+def count_prompt_tokens_from_outputs(engine_outputs: list[Any]) -> int:
+    """Count prompt tokens from engine outputs."""
+    total = 0
+    for _ro in engine_outputs:
+        try:
+            prompt_token_ids = getattr(_ro, "prompt_token_ids", None)
+            if prompt_token_ids is not None:
+                total += len(prompt_token_ids)
+        except Exception:
+            pass
+    return total
+
+
 def make_request_stats(
     req_output: list[Any],
     stage_gen_time_ms: float,
@@ -1282,8 +1365,10 @@ def make_request_stats(
         StageRequestMetrics,
     )
 
+    num_tokens_in = count_prompt_tokens_from_outputs(req_output)
     num_tokens_out = count_tokens_from_outputs(req_output)
     return StageRequestMetrics(
+        num_tokens_in=num_tokens_in,
         num_tokens_out=num_tokens_out,
         stage_gen_time_ms=stage_gen_time_ms,
         batch_id=batch_id,
