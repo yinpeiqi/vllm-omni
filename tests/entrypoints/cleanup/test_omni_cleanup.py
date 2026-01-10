@@ -135,6 +135,9 @@ def test_async_omni_passive_close_cleanup():
     del omni
     gc.collect()
 
+    # add time for cleanup
+    time.sleep(3)
+
     # Check GPU processes after cleanup
     final_gpu_pids = get_gpu_pids()
     leaked_gpu_pids = final_gpu_pids - initial_gpu_pids
