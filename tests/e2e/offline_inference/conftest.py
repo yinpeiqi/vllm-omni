@@ -11,6 +11,7 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -189,7 +190,7 @@ class OmniRunner:
         self,
         prompts: list[dict[str, Any]],
         sampling_params_list: list[SamplingParams] | None = None,
-    ) -> list[Any]:
+    ) -> list[OmniRequestOutput]:
         """
         Generate outputs for the given prompts.
 
@@ -217,7 +218,7 @@ class OmniRunner:
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
         modalities: list[str] | None = None,
-    ) -> list[Any]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
 
@@ -251,7 +252,7 @@ class OmniRunner:
         system_prompt: str | None = None,
         audios: PromptAudioInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> list[Any]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
         Args:
@@ -278,7 +279,7 @@ class OmniRunner:
         system_prompt: str | None = None,
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> list[Any]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
         Args:
@@ -305,7 +306,7 @@ class OmniRunner:
         system_prompt: str | None = None,
         images: PromptImageInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> list[Any]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
         Args:
