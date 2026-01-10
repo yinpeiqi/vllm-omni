@@ -924,7 +924,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     sampling_params_list = [{"temperature": 0.7}]
 
     with pytest.raises(RuntimeError):
-        outputs = omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
+        omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
 
 
 def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
