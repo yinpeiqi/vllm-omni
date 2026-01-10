@@ -543,8 +543,6 @@ class Omni(OmniBase):
         logger.debug(
             f"[{self._name}] Entering scheduling loop: total_requests={total_requests}, stages={num_stages}",
         )
-        # We allow up to 3 errors. Raise exception if more than 3 errors.
-        error_tolerance_limit = 3
 
         while completed_requests < total_requests:
             made_progress = False
@@ -559,12 +557,7 @@ class Omni(OmniBase):
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
-                    # Retry to receive the result again
-                    time.sleep(0.05)
-                    error_tolerance_limit -= 1
-                    if error_tolerance_limit <= 0:
-                        raise RuntimeError(f"[{self._name}] Retry failed. Please check the errors.")
-                    continue
+                    raise RuntimeError(f"[{self._name}] Retry failed. Please check the errors.")
 
                 if result.get("type") == "stage_ready":
                     # Only happens when stage is initialized slower than expected,
