@@ -22,7 +22,7 @@ from vllm.third_party.pynvml import (
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.omni import Omni
 
-stage_config = str(Path(__file__).parent.parent / "offline_inference" / "stage_configs" / "qwen2_5_omni_ci.yaml")
+stage_config = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_thinker_ci.yaml")
 
 
 # Simplified GPU memory check based on vllm-omni/tests/utils.py
