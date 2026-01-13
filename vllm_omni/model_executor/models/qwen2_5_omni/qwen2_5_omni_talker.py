@@ -158,7 +158,9 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             # skip the end token id.
             if hasattr(self.config, "tts_codec_end_token_id"):
                 end_id = int(getattr(self.config, "tts_codec_end_token_id"))
-                if self.suppress_start_id < end_id:
+                if self.suppress_start_id == end_id:
+                    logits[..., end_id + 1 : logits.size(-1)] = -1e9
+                elif self.suppress_start_id < end_id:
                     logits[..., self.suppress_start_id : end_id] = -1e9
                     logits[..., end_id + 1 : logits.size(-1)] = -1e9
                 else:
