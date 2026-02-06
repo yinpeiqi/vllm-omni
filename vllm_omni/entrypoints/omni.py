@@ -10,7 +10,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, Union, overload
 
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -46,20 +46,38 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+# V1 architecture flag: when enabled, use StageEngineCoreClient instead of OmniStage
+VLLM_OMNI_ENABLE_V1 = os.environ.get("VLLM_OMNI_ENABLE_V1", "0").lower() in ("1", "true", "yes")
 
-def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
+if TYPE_CHECKING:
+    from vllm_omni.engine.stage_core_client import StageMPClient
+
+# Type alias for stage objects (OmniStage for V0, StageMPClient for V1)
+StageType = Union[OmniStage, "StageMPClient"]
+
+
+def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg, use_v1: bool = False):
     """Weak reference cleanup function for OmniBase instances."""
     if stage_list:
-        for q in stage_in_queues:
-            try:
-                q.put_nowait(SHUTDOWN_TASK)
-            except Exception as e:
-                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
-        for stage in stage_list:
-            try:
-                stage.stop_stage_worker()
-            except Exception as e:
-                logger.warning(f"Failed to stop stage worker: {e}")
+        if use_v1:
+            # V1: StageEngineCoreClient uses shutdown() method
+            for stage in stage_list:
+                try:
+                    stage.shutdown()
+                except Exception as e:
+                    logger.warning(f"Failed to shutdown stage engine core: {e}")
+        else:
+            # V0: OmniStage uses stop_stage_worker() and queues
+            for q in stage_in_queues:
+                try:
+                    q.put_nowait(SHUTDOWN_TASK)
+                except Exception as e:
+                    logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+            for stage in stage_list:
+                try:
+                    stage.stop_stage_worker()
+                except Exception as e:
+                    logger.warning(f"Failed to stop stage worker: {e}")
     try_close_ray(ray_pg)
 
 
@@ -104,8 +122,11 @@ class OmniBase:
         model = omni_snapshot_download(model)
         kwargs["model"] = model
 
+        # V1 architecture flag
+        self._use_v1 = VLLM_OMNI_ENABLE_V1
+
         # Stage management attributes
-        self.stage_list: list[OmniStage] = []
+        self.stage_list: list[StageType] = []
         self._stage_in_queues: list[mp.Queue] = []
         self._stage_out_queues: list[mp.Queue] = []
         self._stages_ready: set[int] = set()
@@ -116,7 +137,7 @@ class OmniBase:
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
         # based on stage_type in YAML config (handled in omni_stage.py)
-        logger.info(f"Initializing stages for model: {model}")
+        logger.info(f"Initializing stages for model: {model} (V1={self._use_v1})")
         self._initialize_stages(model, kwargs)
 
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
@@ -248,18 +269,34 @@ class OmniBase:
         # async chunk remains the same for each stage
         self.async_chunk = self._is_async_chunk_enable(self.stage_configs)
 
-        # Build OmniStage instances in parallel, preserve original order
-        def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
-            idx, cfg = idx_cfg
-            return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
+        # Build stage instances in parallel, preserve original order
+        # V1 uses StageMPClient, V0 uses OmniStage
+        if self._use_v1:
+            from vllm_omni.engine.stage_core_client import StageMPClient
 
-        with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
-            futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
-            results: list[tuple[int, OmniStage]] = []
-            for fut in as_completed(futures):
-                results.append(fut.result())
-        results.sort(key=lambda x: x[0])
-        self.stage_list = [st for _, st in results]
+            def _build_stage_v1(idx_cfg: tuple[int, Any]) -> tuple[int, "StageMPClient"]:
+                idx, cfg = idx_cfg
+                return idx, StageMPClient(cfg, model, stage_init_timeout=stage_init_timeout)
+
+            with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
+                futures = [executor.submit(_build_stage_v1, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
+                results: list[tuple[int, StageType]] = []
+                for fut in as_completed(futures):
+                    results.append(fut.result())
+            results.sort(key=lambda x: x[0])
+            self.stage_list = [st for _, st in results]
+        else:
+            def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
+                idx, cfg = idx_cfg
+                return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
+
+            with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
+                futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
+                results_v0: list[tuple[int, OmniStage]] = []
+                for fut in as_completed(futures):
+                    results_v0.append(fut.result())
+            results_v0.sort(key=lambda x: x[0])
+            self.stage_list = [st for _, st in results_v0]
         self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug(f"[{self._name}] Loaded {len(self.stage_list)} stages")
@@ -273,8 +310,9 @@ class OmniBase:
         self._stage_init_timeout = max(0, int(stage_init_timeout))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stages(model)
-        # Wait for all stages to report readiness before seeding
-        self._wait_for_stages_ready(timeout=init_timeout)
+        if not self._use_v1:
+            # Wait for all stages to report readiness before seeding
+            self._wait_for_stages_ready(timeout=init_timeout)
 
     def _is_async_chunk_enable(self, stage_args: list) -> bool:
         """get async chunk flag"""
@@ -283,13 +321,63 @@ class OmniBase:
 
     def _start_stages(self, model: str) -> None:
         """Start all stage processes."""
+        if self._use_v1:
+            self._start_stages_v1(model)
+            # self.output_processor = MultimodalOutputProcessor(
+            #     tokenizer=self.llm_engine.tokenizer,
+            #     log_stats=self.llm_engine.log_stats,
+            #     engine_core_output_type=engine_args.engine_output_type,
+            # )
+            # self.input_processor = OmniInputProcessor(
+            #     vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
+            # )
+
+            # # Load the Input/Output processor plugin if any
+            # io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
+            # self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
+            # self.input_processor = self.llm_engine.input_processor
+
+        else:
+            self._start_stages_v0(model)
+
+    def _start_stages_v1(self, model: str) -> None:
+        """Start all stage processes using V1 architecture (StageEngineCoreClient)."""
+        # V1: StageEngineCoreClient handles its own process management
+        # No need for separate queues - the client manages IPC internally
+        for stage_id, stage in enumerate(self.stage_list):
+            stage_connectors_config = get_stage_connector_config(
+                self.omni_transfer_config,
+                stage_id,
+            )
+
+            # Inject YAML-resolved connector config into omni_kv_config for
+            # in-engine usage (GPU model runner reads model_config.omni_kv_config).
+            try:
+                omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(
+                    self.omni_transfer_config, stage_id
+                )
+                if omni_conn_cfg:
+                    inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
+            except Exception as e:
+                logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
+
+            # V1: Start the stage engine core
+            # stage.start(
+            #     model=model,
+            #     connectors_config=stage_connectors_config,
+            # )
+
+            logger.debug(f"[{self._name}] Stage-{stage_id} engine core started (V1)")
+
+    def _start_stages_v0(self, model: str) -> None:
+        """Start all stage processes using V0 architecture (OmniStage)."""
         if self.worker_backend == "ray":
             # Initialize Ray Cluster
             self._ray_pg = create_placement_group(
                 number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
             )
 
-        for stage_id, stage in enumerate[OmniStage](self.stage_list):
+        for stage_id, stage in enumerate(self.stage_list):
             in_q = self._queue_cls()
             out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
@@ -326,7 +414,7 @@ class OmniBase:
 
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
 
-    def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
+    def _process_stage_ready(self, stage: StageType, stage_id: int, result: dict[str, Any]) -> None:
         self._stages_ready.add(stage_id)
         logger.info(f"[{self._name}] Stage-{stage_id} reported ready")
 
@@ -528,6 +616,7 @@ class Omni(OmniBase):
             self.stage_list,
             self._stage_in_queues,
             self._ray_pg,
+            self._use_v1,
         )
 
     @overload
@@ -693,7 +782,12 @@ class Omni(OmniBase):
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
-            self.stage_list[0].submit(task)
+            if self._use_v1:
+                logger.info(f"[{self._name}] Enqueuing request {req_id} to stage-0 (V1), task: {task}")
+                self.stage_list[0].add_request(task)
+            else:
+                # OmniStage uses submit() method
+                self.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
@@ -800,8 +894,9 @@ class Omni(OmniBase):
 
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
+                    next_stage: StageType = self.stage_list[next_stage_id]
                     try:
+                        # execute the custom_process_input_func. Should be handle by the orchestrator.
                         next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
                     except Exception as e:
                         logger.exception(
@@ -864,3 +959,4 @@ class Omni(OmniBase):
     @property
     def _name(self) -> str:
         return "Orchestrator"
+

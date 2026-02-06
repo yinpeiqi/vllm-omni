@@ -329,6 +329,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             OutputProcessorOutput containing processed request outputs
             and list of request IDs to abort
         """
+        logger.info(f"Processing engine core outputs: {engine_core_outputs}")
         self._reqid_to_mm_type.clear()
         for eco in engine_core_outputs:
             mm_type = (self.engine_core_output_type or "").lower()
@@ -426,6 +427,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     req_state.mm_accumulated = None
                     req_state.mm_type = None
 
+        logger.info(f"Request outputs: {request_outputs}")
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
@@ -459,7 +461,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 self._process_pooling_output(eco)
             else:
                 self._process_text_output(eco)
-
+        if eco.pooling_output is not None:
+            if isinstance(eco.pooling_output, dict):
+                for k, v in eco.pooling_output.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.info(f"Pooling output: key: {k}, shape: {v.shape}, dtype: {v.dtype}")
+                    else:
+                        logger.info(f"Pooling output: key: {k}, value: {v}")
+            else:
+                if isinstance(eco.pooling_output, torch.Tensor):
+                    logger.info(f"Pooling output: shape: {eco.pooling_output.shape}, dtype: {eco.pooling_output.dtype}")
+        
     # ---- modality processors ----
     def _process_image_output(self, eco: EngineCoreOutput) -> None:
         """Ensure image tensors are surfaced via pooling_output for vLLM."""

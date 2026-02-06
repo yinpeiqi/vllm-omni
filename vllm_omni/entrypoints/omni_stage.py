@@ -907,11 +907,13 @@ def _stage_worker(
             else:
                 stage_engine = cast(OmniLLM, stage_engine)
                 batch_engine_sampling_params = cast(SamplingParams, batch_engine_sampling_params)
+                logger.info(f"Batch engine inputs: {batch_engine_inputs}")
                 results = stage_engine.generate(
                     batch_engine_inputs,  # type: ignore # silent complaints about list of subclassed TypedDict
                     batch_engine_sampling_params,
                     use_tqdm=False,
                 )
+                logger.info(f"Generation results: {results}")
                 gen_outputs.extend(results)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
