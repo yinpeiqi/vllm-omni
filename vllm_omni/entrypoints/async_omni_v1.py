@@ -16,6 +16,9 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
+from vllm.outputs import PoolingRequestOutput
+from vllm.pooling_params import PoolingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -79,6 +82,15 @@ class AsyncOmniV1(EngineClient):
         self.async_chunk = async_chunk
         self.output_modalities = output_modalities or []
 
+        logger.info(f"[AsyncOmniV1] Initializing with model {model}")
+        logger.info(f"[AsyncOmniV1] stage_configs: {stage_configs}")
+        logger.info(f"[AsyncOmniV1] stage_configs_path: {stage_configs_path}")
+        logger.info(f"[AsyncOmniV1] stage_init_timeout: {stage_init_timeout}")
+        logger.info(f"[AsyncOmniV1] log_requests: {log_requests}")
+        logger.info(f"[AsyncOmniV1] enable_stats: {enable_stats}")
+        logger.info(f"[AsyncOmniV1] async_chunk: {async_chunk}")
+        logger.info(f"[AsyncOmniV1] output_modalities: {output_modalities}")
+        logger.info(f"[AsyncOmniV1] kwargs: {kwargs}")
         # Initialize AsyncOmniEngine
         self.engine = AsyncOmniEngine(
             model=model,
@@ -111,6 +123,15 @@ class AsyncOmniV1(EngineClient):
     def num_stages(self) -> int:
         """Get the number of stages."""
         return self.engine.num_stages
+
+    @property
+    def renderer(self):
+        """Renderer is required by EngineClient protocol.
+
+        AsyncOmniV1 is primarily an orchestrator over multiple EngineCore stages,
+        and currently does not expose a unified renderer.
+        """
+        raise NotImplementedError("AsyncOmniV1.renderer is not implemented.")
 
     # ==================== Generate Method ====================
 
@@ -185,6 +206,7 @@ class AsyncOmniV1(EngineClient):
             self.request_states[request_id] = req_state
 
             # Add request to stage 0
+            logger.info("[AsyncOmniV1] submit request %s to stage-0", request_id)
             await self.engine.add_request(
                 stage_id=0,
                 request_id=request_id,
@@ -193,6 +215,7 @@ class AsyncOmniV1(EngineClient):
             )
             metrics.stage_first_ts[0] = time.time()
             req_start_ts[request_id] = time.time()
+            logger.info("[AsyncOmniV1] submitted request %s to stage-0", request_id)
 
             logger.info(
                 f"[AsyncOmniV1] Entering scheduling loop: stages={self.num_stages}, "
@@ -245,6 +268,24 @@ class AsyncOmniV1(EngineClient):
             logger.info(f"[AsyncOmniV1] Request {request_id} aborted.")
             raise
 
+    async def encode(
+        self,
+        prompt: Any,
+        pooling_params: PoolingParams,
+        request_id: str,
+        lora_request: LoRARequest | None = None,
+        trace_headers: dict[str, str] | None = None,
+        priority: int = 0,
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[PoolingRequestOutput, None]:
+        """EngineClient.encode() stub.
+
+        Omni pipeline currently exposes only generate() API at orchestrator level.
+        """
+        raise NotImplementedError("AsyncOmniV1.encode is not implemented.")
+        if False:  # pragma: no cover - keep as AsyncGenerator type
+            yield None  # type: ignore[misc]
+
     # ==================== Processing Methods ====================
 
     async def _process_sequential_results(
@@ -263,8 +304,20 @@ class AsyncOmniV1(EngineClient):
             finished = False
             while not finished:
                 # Wait for result from this stage
+                logger.debug(
+                    "[AsyncOmniV1] req=%s stage-%s waiting for output (queue size=%s)",
+                    request_id,
+                    stage_id,
+                    getattr(req_state.queue, "qsize", lambda: "NA")(),
+                )
                 result = await req_state.queue.get()
                 assert stage_id == req_state.stage_id
+                logger.debug(
+                    "[AsyncOmniV1] req=%s stage-%s got output result keys=%s",
+                    request_id,
+                    stage_id,
+                    list(result.keys()) if isinstance(result, dict) else type(result),
+                )
 
                 # Process the result
                 engine_outputs, finished, output_to_yield = self._process_single_result(
@@ -277,9 +330,17 @@ class AsyncOmniV1(EngineClient):
                 )
 
                 if output_to_yield:
+                    logger.debug(
+                        "[AsyncOmniV1] req=%s stage-%s yielding final_output_type=%s finished=%s",
+                        request_id,
+                        stage_id,
+                        getattr(output_to_yield, "final_output_type", None),
+                        getattr(getattr(output_to_yield, "request_output", None), "finished", None),
+                    )
                     yield output_to_yield
 
             # Stage finished, prepare next stage
+            logger.info("[AsyncOmniV1] req=%s stage-%s finished; preparing forward", request_id, stage_id)
             if not isinstance(engine_outputs, list):
                 engine_outputs = [engine_outputs]
 
@@ -290,14 +351,27 @@ class AsyncOmniV1(EngineClient):
             next_stage_id = stage_id + 1
             if next_stage_id <= final_stage_id_for_e2e:
                 # Process inputs for next stage from current stage outputs
+                logger.info("[AsyncOmniV1] req=%s forwarding stage-%s -> stage-%s", request_id, stage_id, next_stage_id)
                 next_inputs = self.engine.process_stage_engine_inputs(
                     stage_id=next_stage_id,
                     stage_list=[self.engine.get_stage_client(i) for i in range(self.num_stages)],
                     prompt=prompt,
                 )
+                logger.info(
+                    "[AsyncOmniV1] req=%s computed %d next_inputs for stage-%s",
+                    request_id,
+                    len(next_inputs),
+                    next_stage_id,
+                )
 
                 # Add request to next stage
                 for next_input in next_inputs:
+                    logger.debug(
+                        "[AsyncOmniV1] req=%s submit to stage-%s prompt_type=%s",
+                        request_id,
+                        next_stage_id,
+                        type(next_input),
+                    )
                     await self.engine.add_request(
                         stage_id=next_stage_id,
                         request_id=request_id,
@@ -462,25 +536,41 @@ class AsyncOmniV1(EngineClient):
 
                     # Poll all stages for outputs
                     for stage_id in range(engine.num_stages):
-                        stage_client = engine.get_stage_client(stage_id)
-
-                        # Try to get output from this stage (non-blocking)
+                        # Try to get output from this stage (non-blocking).
+                        # NOTE: We pull EngineCoreOutputs from StageAsyncCoreClient inside
+                        # AsyncOmniEngine.get_output_async(stage_id), and run that stage's
+                        # OutputProcessor.process_outputs() to produce RequestOutput objects.
                         try:
-                            outputs = await asyncio.wait_for(
-                                stage_client.get_output_async(),
-                                timeout=0.001
+                            request_outputs = await asyncio.wait_for(
+                                engine.get_output_async(stage_id),
+                                timeout=0.001,
                             )
                         except asyncio.TimeoutError:
                             continue
+                        except Exception:
+                            logger.exception(
+                                "[AsyncOmniV1] output_handler get_output_async failed for stage-%s",
+                                stage_id,
+                            )
+                            raise
+
+                        if not request_outputs:
+                            continue
 
                         idle = False
+                        logger.debug(
+                            "[AsyncOmniV1] output_handler stage-%s got %d outputs",
+                            stage_id,
+                            len(request_outputs),
+                        )
 
                         # Process each output
-                        for output in outputs.outputs:
+                        for output in request_outputs:
                             req_id = output.request_id
                             req_state = request_states.get(req_id)
 
                             if req_state is None:
+                                logger.debug(list(request_states.keys()))
                                 logger.debug(
                                     f"[AsyncOmniV1] Request may have been aborted; "
                                     f"dropping output for req {req_id} at stage-{stage_id}"
@@ -501,6 +591,12 @@ class AsyncOmniV1(EngineClient):
                             else:
                                 await req_state.queue.put(result)
                                 req_state.stage_id = stage_id
+                                logger.debug(
+                                    "[AsyncOmniV1] output_handler enqueued req=%s stage-%s (queue size=%s)",
+                                    req_id,
+                                    stage_id,
+                                    getattr(req_state.queue, "qsize", lambda: "NA")(),
+                                )
 
                     if idle:
                         await asyncio.sleep(0.001)  # Avoid CPU overload when idle
@@ -555,9 +651,13 @@ class AsyncOmniV1(EngineClient):
         # TODO: Implement request draining if wait_for_inflight_requests
 
         if clear_cache:
-            for stage_id in range(self.engine.num_stages):
-                await self.engine.reset_prefix_cache(stage_id=stage_id)
-                await self.engine.reset_mm_cache(stage_id=stage_id)
+            # Clear caches for all stages.
+            await self.reset_prefix_cache(
+                reset_running_requests=not wait_for_inflight_requests,
+                reset_connector=True,
+            )
+            await self.reset_mm_cache()
+            await self.reset_encoder_cache()
 
     async def resume_generation(self) -> None:
         """Resume generation."""
@@ -569,6 +669,69 @@ class AsyncOmniV1(EngineClient):
         """Check if paused."""
         async with self._pause_cond:
             return self._paused
+
+    async def start_profile(self) -> None:
+        """Start profiling all stages."""
+        for stage_id in range(self.engine.num_stages):
+            await self.engine.get_stage_client(stage_id).profile_async(True)
+
+    async def stop_profile(self) -> None:
+        """Stop profiling all stages."""
+        for stage_id in range(self.engine.num_stages):
+            await self.engine.get_stage_client(stage_id).profile_async(False)
+
+    async def reset_mm_cache(self) -> None:
+        """Reset the multi-modal cache for all stages."""
+        for stage_id in range(self.engine.num_stages):
+            await self.engine.get_stage_client(stage_id).reset_mm_cache_async()
+
+    async def reset_encoder_cache(self) -> None:
+        """Reset the encoder cache for all stages."""
+        for stage_id in range(self.engine.num_stages):
+            await self.engine.get_stage_client(stage_id).reset_encoder_cache_async()
+
+    async def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        """Reset the prefix cache for all stages.
+
+        Returns True if all stages report success.
+        """
+        ok = True
+        for stage_id in range(self.engine.num_stages):
+            stage_ok = await self.engine.get_stage_client(stage_id).reset_prefix_cache_async(
+                reset_running_requests=reset_running_requests,
+                reset_connector=reset_connector,
+            )
+            ok = ok and bool(stage_ok)
+        return ok
+
+    async def sleep(self, level: int = 1) -> None:
+        """Sleep all stages."""
+        for stage_id in range(self.engine.num_stages):
+            await self.engine.get_stage_client(stage_id).sleep_async(level)
+
+    async def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up all stages."""
+        for stage_id in range(self.engine.num_stages):
+            await self.engine.get_stage_client(stage_id).wake_up_async(tags)
+
+    async def is_sleeping(self) -> bool:
+        """Return whether all stages are sleeping."""
+        states = []
+        for stage_id in range(self.engine.num_stages):
+            states.append(await self.engine.get_stage_client(stage_id).is_sleeping_async())
+        return all(states) if states else False
+
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Load a new LoRA adapter into all stages."""
+        ok = True
+        for stage_id in range(self.engine.num_stages):
+            stage_ok = await self.engine.get_stage_client(stage_id).add_lora_async(lora_request)
+            ok = ok and bool(stage_ok)
+        return ok
 
     # ==================== Properties ====================
 
