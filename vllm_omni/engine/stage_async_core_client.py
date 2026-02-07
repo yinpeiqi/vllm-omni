@@ -1,0 +1,494 @@
+"""
+Stage Async Engine Core Client for vLLM-Omni V1 architecture.
+
+Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
+"""
+
+from __future__ import annotations
+
+import importlib
+import multiprocessing as mp
+import os
+import fcntl
+import time
+from typing import TYPE_CHECKING, Any, Literal
+
+from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
+from vllm.usage.usage_lib import UsageContext
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.core_client import AsyncMPClient
+from vllm.v1.executor import Executor
+
+from vllm_omni.entrypoints.omni_stage import _resolve_worker_cls
+from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
+from vllm_omni.entrypoints.utils import resolve_model_config_path
+from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
+from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+
+if TYPE_CHECKING:
+    from vllm.inputs import TextPrompt
+    from vllm.v1.engine import EngineCoreOutput
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = init_logger(__name__)
+
+
+class StageAsyncCoreClient(AsyncMPClient):
+    """Stage async client that inherits from vLLM's AsyncMPClient.
+
+    Fully reuses AsyncMPClient.__init__ for:
+    - ZMQ setup, sockets
+    - launch_core_engines() -> EngineCoreProc
+    - outputs_queue, output_queue_task
+    - All utility methods (shutdown, get_output_async, abort_requests_async, etc.)
+
+    This is the async version of StageMPClient, designed for use with AsyncOmniEngine.
+    """
+
+    def __init__(
+        self,
+        stage_config: Any,
+        model: str,
+        stage_init_timeout: int = 300,
+    ):
+        # Parse stage config first
+        self._stage_config = stage_config
+        self._stage_id: int = stage_config.stage_id
+        self._stage_type: Literal["llm", "diffusion"] = getattr(
+            stage_config, "stage_type", "llm"
+        )
+        self.engine_args = stage_config.engine_args
+        self.model_stage = stage_config.engine_args.model_stage
+        self.requires_multimodal_data = getattr(
+            stage_config.runtime, "requires_multimodal_data", False
+        )
+        self.engine_input_source = getattr(stage_config, "engine_input_source", [])
+        self.engine_output_type = getattr(
+            stage_config.engine_args, "engine_output_type", None
+        )
+        self.engine_outputs = None
+        self.is_comprehension = getattr(stage_config, "is_comprehension", False)
+        self.stage_type: Literal["llm", "diffusion"] = getattr(
+            stage_config, "stage_type", "llm"
+        )
+
+        # Custom input processing function
+        if hasattr(stage_config, "custom_process_input_func"):
+            module_path, func_name = stage_config.custom_process_input_func.rsplit(
+                ".", 1
+            )
+            module = importlib.import_module(module_path)
+            self.custom_process_input_func = getattr(module, func_name)
+        else:
+            self.custom_process_input_func = None
+
+        self.final_output = getattr(stage_config, "final_output", False)
+        self.final_output_type = getattr(stage_config, "final_output_type", None)
+
+        # Default sampling params
+        default_sampling_params = getattr(stage_config, "default_sampling_params", {})
+        default_sampling_params = _to_dict(default_sampling_params)
+        try:
+            self.default_sampling_params = (
+                SamplingParams
+                if self.stage_type == "llm"
+                else OmniDiffusionSamplingParams
+            )(**default_sampling_params)
+        except TypeError as error:
+            raise TypeError(
+                f"Invalid default_sampling_params for stage {self.stage_id}: {error}"
+            ) from error
+
+        if self._stage_type == "diffusion":
+            raise NotImplementedError(
+                "Diffusion not supported with EngineCore. Use V0 architecture."
+            )
+
+        logger.info(
+            f"[StageAsyncCoreClient] Stage-{self._stage_id} stage_config: {stage_config}"
+        )
+
+        # Engine args
+        self._engine_args_raw = stage_config.engine_args
+
+        # Runtime config
+        self._runtime_cfg = getattr(stage_config, "runtime", {})
+        self._requires_multimodal_data = getattr(
+            self._runtime_cfg, "requires_multimodal_data", False
+        )
+
+        # Input/output config
+        self._engine_input_source: list[int] = getattr(
+            stage_config, "engine_input_source", []
+        )
+        self._final_output: bool = getattr(stage_config, "final_output", False)
+        self._final_output_type: str | None = getattr(
+            stage_config, "final_output_type", None
+        )
+
+        # Default sampling params
+        default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
+        SPClass = (
+            SamplingParams if self._stage_type == "llm" else OmniDiffusionSamplingParams
+        )
+        self._default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+
+        # Custom input processing
+        if hasattr(stage_config, "custom_process_input_func"):
+            mod_path, fn_name = stage_config.custom_process_input_func.rsplit(".", 1)
+            self._custom_process_input_func = getattr(
+                importlib.import_module(mod_path), fn_name
+            )
+        else:
+            self._custom_process_input_func = None
+
+        # Engine outputs (set by orchestrator)
+        self._engine_outputs: Any = None
+
+        from vllm_omni.plugins import load_omni_general_plugins
+
+        load_omni_general_plugins()
+
+        # Set multiprocessing method to spawn
+        if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+            logger.info("[StageAsync] Set VLLM_WORKER_MULTIPROC_METHOD=spawn")
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+
+        # Build VllmConfig
+        engine_args_dict = _to_dict(self._engine_args_raw)
+        engine_args_dict["model"] = model
+
+        if self._stage_type != "diffusion":
+            _resolve_worker_cls(engine_args_dict)
+
+        logger.info(
+            f"[StageAsyncCoreClient] Stage-{self._stage_id} engine_args_dict: {engine_args_dict}"
+        )
+
+        # Device mapping
+        device_type = None
+        try:
+            from vllm_omni.platforms import current_omni_platform
+
+            device_type = current_omni_platform.device_type
+            set_stage_devices(
+                self._stage_id,
+                self._runtime_cfg.get("devices"),
+                device_type=device_type,
+            )
+            logger.info(
+                f"[StageAsyncCoreClient] Stage-{self._stage_id} set devices for {device_type}, "
+                f"runtime devices: {self._runtime_cfg.get('devices')}"
+            )
+        except Exception as e:
+            logger.warning("Device setup failed: %s", e)
+
+        # Sequential initialization with device locking
+        lock_files = []
+        try:
+            # Get parallel sizes
+            if "parallel_config" in engine_args_dict:
+                parallel_config = engine_args_dict["parallel_config"]
+                tensor_parallel_size = parallel_config.get("tensor_parallel_size", 1)
+                pipeline_parallel_size = parallel_config.get("pipeline_parallel_size", 1)
+                data_parallel_size = parallel_config.get("data_parallel_size", 1)
+                prefill_context_parallel_size = parallel_config.get(
+                    "prefill_context_parallel_size", 1
+                )
+                sequence_parallel_size = parallel_config.get("sequence_parallel_size", 1)
+                cfg_parallel_size = parallel_config.get("cfg_parallel_size", 1)
+            else:
+                tensor_parallel_size = engine_args_dict.get("tensor_parallel_size", 1)
+                pipeline_parallel_size = engine_args_dict.get(
+                    "pipeline_parallel_size", 1
+                )
+                data_parallel_size = engine_args_dict.get("data_parallel_size", 1)
+                prefill_context_parallel_size = engine_args_dict.get(
+                    "prefill_context_parallel_size", 1
+                )
+                sequence_parallel_size = 1
+                cfg_parallel_size = 1
+
+            # Calculate total devices needed
+            num_devices_per_stage = (
+                tensor_parallel_size
+                * pipeline_parallel_size
+                * data_parallel_size
+                * prefill_context_parallel_size
+                * sequence_parallel_size
+                * cfg_parallel_size
+            )
+
+            # Get physical device IDs
+            device_control_env = current_omni_platform.device_control_env_var
+            visible_devices_str = os.environ.get(device_control_env)
+            physical_devices = []
+
+            if visible_devices_str:
+                try:
+                    physical_devices = [
+                        int(x.strip())
+                        for x in visible_devices_str.split(",")
+                        if x.strip()
+                    ]
+                except (ValueError, IndexError):
+                    pass
+
+            if not physical_devices:
+                num_devices = current_omni_platform.get_device_count()
+                physical_devices = list(range(num_devices))
+
+            # Determine devices to lock
+            num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
+            devices_to_lock = sorted(physical_devices[:num_devices_to_lock])
+
+            logger.debug(
+                "Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d, SP=%d, CFG=%d; "
+                "will lock %d devices: %s",
+                tensor_parallel_size,
+                pipeline_parallel_size,
+                data_parallel_size,
+                prefill_context_parallel_size,
+                sequence_parallel_size,
+                cfg_parallel_size,
+                num_devices_to_lock,
+                devices_to_lock,
+            )
+
+            # Acquire locks
+            wait_start = time.time()
+            acquired_lock_fds = []
+
+            for device_id in devices_to_lock:
+                lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+                lock_acquired = False
+
+                while not lock_acquired:
+                    try:
+                        lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            os.ftruncate(lock_fd, 0)
+                            os.write(lock_fd, f"{os.getpid()}\n".encode())
+                            os.fsync(lock_fd)
+                            lock_acquired = True
+                            acquired_lock_fds.append(lock_fd)
+                            logger.debug(
+                                "Acquired exclusive lock for device %s", device_id
+                            )
+                        except BlockingIOError:
+                            os.close(lock_fd)
+                            if time.time() - wait_start > stage_init_timeout:
+                                logger.warning(
+                                    "Timeout waiting for device %s initialization lock, "
+                                    "proceeding anyway",
+                                    device_id,
+                                )
+                                break
+                            time.sleep(0.1)
+                    except OSError as e:
+                        logger.debug(
+                            "Failed to acquire lock for device %s: %s, continuing anyway",
+                            device_id,
+                            e,
+                        )
+                        try:
+                            os.close(lock_fd)
+                        except (OSError, NameError):
+                            pass
+                        break
+
+            lock_files = acquired_lock_fds
+        except Exception as e:
+            logger.debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s",
+                self._stage_id,
+                e,
+            )
+
+        # Load stage configurations
+        self.config_path = resolve_model_config_path(model)
+
+        # Initialize connectors
+        self.omni_transfer_config, self.connectors = (
+            initialize_orchestrator_connectors(
+                self.config_path, worker_backend="multi_process", shm_threshold_bytes=65536
+            )
+        )
+
+        # Create engine config
+        engine_args = OmniEngineArgs(**engine_args_dict)
+        vllm_config = engine_args.create_engine_config(
+            usage_context=UsageContext.LLM_CLASS
+        )
+        executor_class = Executor.get_class(vllm_config)
+
+        try:
+            if self._stage_type == "diffusion":
+                raise NotImplementedError(
+                    "Diffusion not supported with EngineCore. Use V0 architecture."
+                )
+            else:
+                logger.info(
+                    f"[StageAsyncCoreClient] Stage-{self._stage_id} initializing EngineCore"
+                )
+                # Call super().__init__ - starts EngineCore, ZMQ, outputs_queue, etc.
+                super().__init__(vllm_config, executor_class, log_stats=False)
+        finally:
+            # Release all locks
+            for lock_fd in lock_files:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                    logger.debug("Released initialization lock (fd=%s)", lock_fd)
+                except (OSError, ValueError):
+                    pass
+
+        logger.info(
+            f"[StageAsyncCoreClient] Stage-{self._stage_id} EngineCore running"
+        )
+
+    # ==================== Stage Properties ====================
+
+    @property
+    def stage_id(self) -> int:
+        return self._stage_id
+
+    @property
+    def stage_type(self) -> Literal["llm", "diffusion"]:
+        return self._stage_type
+
+    @property
+    def final_output(self) -> bool:
+        return self._final_output
+
+    @property
+    def final_output_type(self) -> str | None:
+        return self._final_output_type
+
+    @property
+    def default_sampling_params(self) -> OmniSamplingParams:
+        return self._default_sampling_params
+
+    @property
+    def engine_outputs(self) -> Any:
+        return self._engine_outputs
+
+    @property
+    def engine_input_source(self) -> list[int]:
+        return self._engine_input_source
+
+    @property
+    def requires_multimodal_data(self) -> bool:
+        return self._requires_multimodal_data
+
+    @property
+    def engine_args(self) -> Any:
+        return self._engine_args_raw
+
+    # ==================== Overrides ====================
+
+    async def add_request_async(
+        self, request: EngineCoreRequest | dict[str, Any]
+    ) -> None:
+        """Add request - supports both EngineCoreRequest and task dict."""
+        if isinstance(request, dict):
+            request = self._task_to_request(request)
+        logger.info(
+            f"[StageAsyncCoreClient] Stage-{self._stage_id} adding request: {request}"
+        )
+        await super().add_request_async(request)
+
+    # ==================== Stage Methods ====================
+
+    def set_engine_outputs(self, engine_outputs: "EngineCoreOutput") -> None:
+        """Set engine outputs (called by orchestrator)."""
+        self._engine_outputs = engine_outputs
+
+    def process_engine_inputs(
+        self,
+        stage_list: list[Any],
+        prompt: "OmniTokensPrompt | TextPrompt | None" = None,
+    ) -> list["OmniTokensPrompt | TextPrompt"]:
+        """Process inputs from upstream stages."""
+        from vllm_omni.inputs.data import OmniTokensPrompt
+
+        if self._custom_process_input_func is not None:
+            logger.info(
+                f"[StageAsyncCoreClient] Stage-{self._stage_id} using custom process input function"
+            )
+            return self._custom_process_input_func(
+                stage_list,
+                self._engine_input_source,
+                prompt,
+                self._requires_multimodal_data,
+            )
+
+        if not self._engine_input_source:
+            raise ValueError(f"engine_input_source empty for stage {self._stage_id}")
+
+        source_id = self._engine_input_source[0]
+        source_outputs = stage_list[source_id].engine_outputs
+
+        if not isinstance(prompt, list):
+            prompt = [prompt]
+
+        mm_data = {
+            so.request_id: p.get("multi_modal_data")
+            for so, p in zip(source_outputs, prompt)
+        }
+
+        logger.info(
+            f"[StageAsyncCoreClient] Stage-{self._stage_id} processing engine inputs: {source_outputs}"
+        )
+        return [
+            OmniTokensPrompt(
+                prompt_token_ids=so.outputs[0].token_ids,
+                multi_modal_data=(
+                    mm_data[so.request_id] if self._requires_multimodal_data else None
+                ),
+            )
+            for so in source_outputs
+        ]
+
+    # ==================== Internal ====================
+
+    def _task_to_request(self, task: dict[str, Any]) -> EngineCoreRequest:
+        """Convert task dict to EngineCoreRequest."""
+        request_id = str(task.get("request_id", ""))
+        engine_inputs = task.get("engine_inputs", {})
+        sampling_params = task.get("sampling_params", self._default_sampling_params)
+
+        # Extract from engine_inputs
+        if isinstance(engine_inputs, dict):
+            prompt_token_ids = engine_inputs.get("prompt_token_ids")
+            mm_features = engine_inputs.get("mm_features")
+            prompt_embeds = engine_inputs.get("prompt_embeds")
+        elif hasattr(engine_inputs, "prompt_token_ids"):
+            prompt_token_ids = engine_inputs.prompt_token_ids
+            mm_features = getattr(engine_inputs, "mm_features", None)
+            prompt_embeds = getattr(engine_inputs, "prompt_embeds", None)
+        else:
+            prompt_token_ids = None
+            mm_features = None
+            prompt_embeds = None
+
+        return EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            mm_features=mm_features,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            eos_token_id=None,
+            arrival_time=time.time(),
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            prompt_embeds=prompt_embeds,
+        )
