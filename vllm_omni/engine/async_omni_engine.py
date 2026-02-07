@@ -7,10 +7,10 @@ Does NOT inherit from any class. Only implements add_request functionality.
 
 from __future__ import annotations
 
-import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from vllm.logger import init_logger
+from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.engine.stage_async_core_client import StageAsyncCoreClient
 from vllm_omni.engine.input_processor import OmniInputProcessor
@@ -20,15 +20,15 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
+from omegaconf import OmegaConf
 
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
-    from vllm.inputs import PromptType
-    from vllm.lora.request import LoRARequest
-    from vllm.pooling_params import PoolingParams
-    from vllm.sampling_params import SamplingParams
-    from vllm.tokenizers import TokenizerLike
-    from vllm.v1.engine import EngineCoreRequest
+from vllm.config import VllmConfig
+from vllm.inputs import PromptType
+from vllm.lora.request import LoRARequest
+from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import TokenizerLike
+from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
 
@@ -61,19 +61,28 @@ class AsyncOmniEngine:
         self.stage_init_timeout = stage_init_timeout
         self.log_requests = log_requests
 
-        # Load stage configurations
-        if stage_configs is None:
-            if stage_configs_path is not None:
-                stage_configs = load_stage_configs_from_yaml(stage_configs_path)
-            else:
-                config_path = resolve_model_config_path(model)
-                stage_configs = load_stage_configs_from_model(config_path)
+        logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
+        logger.info(f"[AsyncOmniEngine] stage_configs: {stage_configs}")
+        logger.info(f"[AsyncOmniEngine] stage_configs_path: {stage_configs_path}")
+        logger.info(f"[AsyncOmniEngine] stage_init_timeout: {stage_init_timeout}")
+        logger.info(f"[AsyncOmniEngine] log_requests: {log_requests}")
+        logger.info(f"[AsyncOmniEngine] kwargs: {kwargs}")
+        ### base engine args
+        tokenizer = kwargs.get("tokenizer", None)
 
-        if not stage_configs:
-            raise ValueError("No stage configurations found")
+        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
+        # Load stage configurations from YAML
+        if stage_configs_path is None:
+            self.config_path = resolve_model_config_path(model)
+            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
+            if not self.stage_configs:
+                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
+                self.stage_configs = OmegaConf.create(default_stage_cfg)
+        else:
+            self.config_path = stage_configs_path
+            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
 
-        self.stage_configs = stage_configs
-        self.num_stages = len(stage_configs)
+        self.num_stages = len(self.stage_configs)
 
         logger.info(
             f"[AsyncOmniEngine] Initializing with {self.num_stages} stages for model {model}"
@@ -106,32 +115,17 @@ class AsyncOmniEngine:
                 stage_init_timeout=self.stage_init_timeout,
             )
 
-            # Get tokenizer and vllm_config from stage client
-            try:
-                # Use collective_rpc to get tokenizer synchronously
-                # Note: This is a blocking call during initialization
-                loop = None
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    pass
+            # Get vllm_config from EngineCoreClient (available after StageAsyncCoreClient init).
+            vllm_config = stage_client.vllm_config
 
-                if loop:
-                    # We're in an async context, but collective_rpc is sync
-                    # We'll get these later in an async method
-                    tokenizer = None
-                    vllm_config = stage_client.vllm_config
-                else:
-                    # Not in async context, safe to call sync method
-                    tokenizer_list = stage_client.collective_rpc("get_tokenizer", timeout=30)
-                    tokenizer = tokenizer_list[0] if tokenizer_list else None
-                    vllm_config = stage_client.vllm_config
-            except Exception as e:
-                logger.warning(
-                    f"[AsyncOmniEngine] Failed to get tokenizer/config for stage {stage_id}: {e}"
-                )
+            # Initialize tokenizer the same way as AsyncOmniLLM.
+            # If skip_tokenizer_init is enabled, tokenizer is intentionally omitted.
+            if vllm_config.model_config.skip_tokenizer_init:
                 tokenizer = None
-                vllm_config = None
+            else:
+                tokenizer = cached_tokenizer_from_config(
+                    model_config=vllm_config.model_config
+                )
 
             # Determine engine output type
             engine_output_type = getattr(
@@ -139,23 +133,17 @@ class AsyncOmniEngine:
             )
 
             # Create input processor
-            if vllm_config is not None and tokenizer is not None:
-                stage_input_processor = OmniInputProcessor(
-                    vllm_config=vllm_config,
-                    tokenizer=tokenizer,
-                )
-            else:
-                stage_input_processor = None
+            stage_input_processor = OmniInputProcessor(
+                vllm_config=vllm_config,
+                tokenizer=tokenizer,
+            )
 
             # Create output processor
-            if tokenizer is not None:
-                stage_output_processor = MultimodalOutputProcessor(
-                    tokenizer=tokenizer,
-                    log_stats=False,
-                    engine_core_output_type=engine_output_type,
-                )
-            else:
-                stage_output_processor = None
+            stage_output_processor = MultimodalOutputProcessor(
+                tokenizer=tokenizer,
+                log_stats=False,
+                engine_core_output_type=engine_output_type,
+            )
 
             # Store references
             self.stage_clients.append(stage_client)
@@ -281,6 +269,7 @@ class AsyncOmniEngine:
         """
         stage_client = self.get_stage_client(stage_id)
         stage_input_processor = self.get_stage_input_processor(stage_id)
+        stage_output_processor = self.get_stage_output_processor(stage_id)
 
         # Step 1: Inject global_request_id into additional_information
         # This allows workers to use the global ID for cross-stage operations like KV transfer
@@ -334,24 +323,90 @@ class AsyncOmniEngine:
                     f"Stage {stage_id} has no input processor, "
                     "cannot process non-EngineCoreRequest prompts"
                 )
-            request = stage_input_processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
+            if prompt_text is not None:
+                # Keep consistent with vLLM AsyncLLM: prompt_text is only accepted
+                # when passing an EngineCoreRequest directly.
+                raise ValueError("should only provide prompt_text with EngineCoreRequest")
+
+            processed = stage_input_processor.process_inputs(
+                request_id=request_id,
+                prompt=prompt,
+                params=params,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
             )
+
+            # Our OmniInputProcessor implementation may return either:
+            # - EngineCoreRequest (vLLM style), or
+            # - (prompt_str, EngineCoreRequest) (legacy omni style).
+            if isinstance(processed, tuple) and len(processed) == 2:
+                prompt_text_from_proc, request = processed
+                prompt_text = prompt_text_from_proc
+            else:
+                request = processed
+                prompt_text = prompt
         else:
             request = prompt
 
-        # Step 4: Add request to stage client
+        # Align with vLLM AsyncLLM: assign a stable internal request id and ensure
+        # request.external_req_id is set (OutputProcessor requires it).
+        stage_input_processor.assign_request_id(request)
+        # TODO: hack here
+        request.request_id = request_id
+
+        # Step 4: Register request in OutputProcessor (this process) so that
+        # EngineCoreOutputs can be converted to RequestOutput via process_outputs().
+        # Must be done before EngineCore starts returning outputs.
+        stage_output_processor.add_request(
+            request=request,
+            prompt=prompt_text,
+            parent_req=None,
+            request_index=0,
+            queue=None,
+        )
+
+        # Step 5: Add request to stage client (EngineCore, separate process)
         await stage_client.add_request_async(request)
 
         if self.log_requests:
             logger.info(f"[AsyncOmniEngine] Added request {request_id} to stage {stage_id}")
+
+    async def get_output_async(self, stage_id: int) -> list[Any]:
+        """Get processed outputs for a stage.
+
+        Pulls EngineCoreOutputs from the stage (EngineCoreClient), then runs the
+        stage's OutputProcessor to convert them into RequestOutput objects.
+
+        This mirrors vLLM's AsyncLLM output_handler behavior, but scoped per stage.
+        """
+        stage_client = self.get_stage_client(stage_id)
+        stage_output_processor = self.get_stage_output_processor(stage_id)
+
+        # 1) Pull EngineCoreOutputs from EngineCore.
+        outputs = await stage_client.get_output_async()
+
+        # 2) Process EngineCoreOutputs -> RequestOutput.
+        processed = stage_output_processor.process_outputs(
+            outputs.outputs,  # type: ignore[arg-type]
+            getattr(outputs, "timestamp", None),
+            None,
+        )
+
+        # 3) Abort any reqs that finished due to stop strings.
+        if getattr(processed, "reqs_to_abort", None):
+            await stage_client.abort_requests_async(processed.reqs_to_abort)
+
+        # Best-effort: propagate scheduler stats if available.
+        try:
+            if hasattr(outputs, "scheduler_stats"):
+                stage_output_processor.update_scheduler_stats(outputs.scheduler_stats)
+        except Exception:
+            pass
+
+        return list(getattr(processed, "request_outputs", []) or [])
 
     # ==================== Multi-Stage Orchestration Methods ====================
 

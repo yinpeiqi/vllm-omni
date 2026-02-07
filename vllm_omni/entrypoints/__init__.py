@@ -13,9 +13,11 @@ Provides high-level interfaces for running omni models including:
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.async_omni_v1 import AsyncOmniV1
 
 __all__ = [
     "AsyncOmni",
     "AsyncOmniDiffusion",
     "Omni",
+    "AsyncOmniV1",
 ]
