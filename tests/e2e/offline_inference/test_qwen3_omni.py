@@ -5,21 +5,23 @@ E2E offline tests for Omni model with video input and audio output.
 """
 
 import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+
 from pathlib import Path
 
 import pytest
 from vllm.assets.video import VideoAsset
 
-from vllm_omni.utils import is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 from .conftest import OmniRunner
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
-if is_rocm():
+if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 else:
@@ -73,6 +75,6 @@ def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
         assert len(audio_output.request_output) > 0
 
         # Verify audio tensor exists and has content
-        audio_tensor = audio_output.request_output[0].multimodal_output["audio"]
+        audio_tensor = audio_output.request_output[0].outputs[0].multimodal_output["audio"]
         assert audio_tensor is not None
         assert audio_tensor.numel() > 0
