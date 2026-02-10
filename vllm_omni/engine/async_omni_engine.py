@@ -2,47 +2,529 @@
 Async Omni Engine for vLLM-Omni V1 architecture.
 
 Manages multiple stages with StageAsyncCoreClient.
-Does NOT inherit from any class. Only implements add_request functionality.
+The Orchestrator child process owns all stage clients and handles
+stage-to-stage transfers. AsyncOmniEngine in the main process is a
+thin proxy that communicates with the Orchestrator via mp.Queues.
 """
 
 from __future__ import annotations
 
+import asyncio
+import multiprocessing as mp
+import queue
+from dataclasses import dataclass, field
 from typing import Any
 
+from omegaconf import OmegaConf
+from vllm.config import VllmConfig
+from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.lora.request import LoRARequest
+from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
+from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.engine.stage_async_core_client import StageAsyncCoreClient
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
+from vllm_omni.engine.stage_async_core_client import StageAsyncCoreClient
 from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
-from omegaconf import OmegaConf
-
-from vllm.config import VllmConfig
-from vllm.inputs import PromptType
-from vllm.lora.request import LoRARequest
-from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingParams
-from vllm.tokenizers import TokenizerLike
-from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
 
 
-class AsyncOmniEngine:
-    """Async Omni Engine managing multiple stages.
+# ============================================================
+# Orchestrator internals (run inside the child process)
+# ============================================================
 
-    Does NOT inherit from any class. Only implements add_request functionality
-    for multi-stage execution.
+@dataclass
+class _OrchestratorRequestState:
+    """Per-request bookkeeping inside the Orchestrator process."""
+
+    request_id: str
+    prompt: Any = None
+    sampling_params_list: list[Any] = field(default_factory=list)
+    final_stage_id: int = 0
+
+
+class _Orchestrator:
+    """Runs inside the Orchestrator child process.
+
+    Owns all StageAsyncCoreClient instances, input/output processors,
+    and handles stage-to-stage transfer logic.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        stage_configs: Any,
+        request_queue: mp.Queue,
+        output_queue: mp.Queue,
+        stage_init_timeout: int = 300,
+        log_requests: bool = True,
+    ) -> None:
+        self.model = model
+        self.stage_configs = stage_configs
+        self.request_queue = request_queue
+        self.output_queue = output_queue
+        self.stage_init_timeout = stage_init_timeout
+        self.log_requests = log_requests
+
+        self.num_stages = len(stage_configs)
+
+        # Will be populated by _initialize_stages
+        self.stage_clients: list[StageAsyncCoreClient] = []
+        self.input_processors: list[OmniInputProcessor] = []
+        self.output_processors: list[MultimodalOutputProcessor] = []
+        self.stage_tokenizers: list[TokenizerLike] = []
+        self.stage_vllm_configs: list[VllmConfig] = []
+        self.connectors: dict[tuple[str, str], Any] = {}
+
+        # Per-request state
+        self.request_states: dict[str, _OrchestratorRequestState] = {}
+
+        self._initialize_stages()
+        self._initialize_connectors()
+
+
+    def _initialize_stages(self) -> None:
+        """Initialize all stage clients and their processors."""
+        for stage_id, stage_cfg in enumerate(self.stage_configs):
+            logger.info(f"[Orchestrator] Initializing stage {stage_id}")
+
+            stage_client = StageAsyncCoreClient(
+                stage_config=stage_cfg,
+                model=self.model,
+                stage_init_timeout=self.stage_init_timeout,
+            )
+
+            vllm_config = stage_client.vllm_config
+
+            if vllm_config.model_config.skip_tokenizer_init:
+                tokenizer = None
+            else:
+                tokenizer = cached_tokenizer_from_config(
+                    model_config=vllm_config.model_config
+                )
+
+            engine_output_type = getattr(
+                stage_cfg.engine_args, "engine_output_type", None
+            )
+
+            stage_input_processor = OmniInputProcessor(
+                vllm_config=vllm_config,
+                tokenizer=tokenizer,
+            )
+
+            stage_output_processor = MultimodalOutputProcessor(
+                tokenizer=tokenizer,
+                log_stats=False,
+                engine_core_output_type=engine_output_type,
+            )
+
+            self.stage_clients.append(stage_client)
+            self.input_processors.append(stage_input_processor)
+            self.output_processors.append(stage_output_processor)
+            self.stage_tokenizers.append(tokenizer)
+            self.stage_vllm_configs.append(vllm_config)
+
+            logger.info(f"[Orchestrator] Stage {stage_id} initialized")
+
+    def _initialize_connectors(self) -> None:
+        """Initialize connectors for cross-stage data transfer."""
+        try:
+            from vllm_omni.distributed.omni_connectors import (
+                initialize_orchestrator_connectors,
+            )
+
+            config_path = resolve_model_config_path(self.model)
+            omni_transfer_config, connectors = initialize_orchestrator_connectors(
+                config_path,
+                worker_backend="multi_process",
+                shm_threshold_bytes=65536,
+            )
+            self.omni_transfer_config = omni_transfer_config
+            self.connectors = connectors
+
+            if connectors:
+                logger.info(
+                    f"[Orchestrator] Initialized {len(connectors)} connectors"
+                )
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Failed to initialize connectors: {e}")
+            self.omni_transfer_config = None
+            self.connectors = {}
+
+
+    async def run(self) -> None:
+        """Main entry point for the Orchestrator event loop."""
+        # Collect metadata to send back to the main process
+        default_sampling_params_list = [
+            sc.default_sampling_params for sc in self.stage_clients
+        ]
+        stage_metadata = []
+        for sc in self.stage_clients:
+            stage_metadata.append({
+                "final_output": sc.final_output,
+                "final_output_type": sc.final_output_type,
+                "stage_type": sc.stage_type,
+            })
+
+        self.output_queue.put({
+            "type": "ready",
+            "num_stages": self.num_stages,
+            "default_sampling_params_list": default_sampling_params_list,
+            "stage_metadata": stage_metadata,
+        })
+
+        logger.info("[Orchestrator] Ready signal sent, starting event loop")
+        await asyncio.gather(
+            self._request_handler(),
+            self._output_handler(),
+        )
+
+    async def _request_handler(self) -> None:
+        """Read messages from the main process via request_queue."""
+        loop = asyncio.get_event_loop()
+        while True:
+            msg = await loop.run_in_executor(None, self.request_queue.get)
+            msg_type = msg.get("type")
+
+            if msg_type == "add_request":
+                await self._handle_add_request(msg)
+            elif msg_type == "abort":
+                await self._handle_abort(msg)
+            elif msg_type == "shutdown":
+                logger.info("[Orchestrator] Received shutdown signal")
+                self._shutdown_stages()
+                break
+            else:
+                logger.warning(f"[Orchestrator] Unknown message type: {msg_type}")
+
+
+    async def _output_handler(self) -> None:
+        """Poll all stages, handle transfers, send final outputs to main."""
+        while True:
+            idle = True
+            for stage_id in range(self.num_stages):
+                try:
+                    request_outputs = await asyncio.wait_for(
+                        self._get_stage_output(stage_id), timeout=0.001
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    logger.exception(
+                        "[Orchestrator] _get_stage_output failed for stage-%s",
+                        stage_id,
+                    )
+                    raise
+
+                if not request_outputs:
+                    continue
+                idle = False
+
+                for output in request_outputs:
+                    req_id = output.request_id
+                    req_state = self.request_states.get(req_id)
+                    if req_state is None:
+                        logger.debug(
+                            "[Orchestrator] Dropping output for unknown req %s "
+                            "at stage-%s",
+                            req_id,
+                            stage_id,
+                        )
+                        continue
+
+                    finished = getattr(output, "finished", False)
+                    stage_client = self.stage_clients[stage_id]
+
+                    # 1) If this stage produces final output → send to main
+                    if stage_client.final_output:
+                        is_fully_done = (
+                            finished
+                            and stage_id == req_state.final_stage_id
+                        )
+                        self.output_queue.put({
+                            "type": "output",
+                            "request_id": req_id,
+                            "stage_id": stage_id,
+                            "engine_outputs": [output],
+                            "metrics": None,
+                            "finished": is_fully_done,
+                        })
+
+
+                    # 2) If stage finished → forward to next stage
+                    if finished and stage_id < req_state.final_stage_id:
+                        await self._forward_to_next_stage(
+                            req_id, stage_id, output, req_state
+                        )
+
+                    # 3) If all stages done → cleanup
+                    if finished and stage_id == req_state.final_stage_id:
+                        self.request_states.pop(req_id, None)
+
+            if idle:
+                await asyncio.sleep(0.001)
+            else:
+                await asyncio.sleep(0)
+
+
+    async def _forward_to_next_stage(
+        self,
+        req_id: str,
+        stage_id: int,
+        output: Any,
+        req_state: _OrchestratorRequestState,
+    ) -> None:
+        """Execute stage transfer: same logic as the old
+        _process_sequential_results in AsyncOmniV1."""
+        if not isinstance(output, list):
+            engine_outputs = [output]
+        else:
+            engine_outputs = output
+
+        # Set outputs on current stage client (for cross-stage data flow)
+        self.stage_clients[stage_id].set_engine_outputs(engine_outputs)
+
+        next_stage_id = stage_id + 1
+        logger.info(
+            "[Orchestrator] req=%s forwarding stage-%s -> stage-%s",
+            req_id,
+            stage_id,
+            next_stage_id,
+        )
+
+        # Process inputs for next stage (custom_process_input_func)
+        next_inputs = self.stage_clients[next_stage_id].process_engine_inputs(
+            stage_list=self.stage_clients,
+            prompt=req_state.prompt,
+        )
+        logger.info(
+            "[Orchestrator] req=%s computed %d next_inputs for stage-%s",
+            req_id,
+            len(next_inputs),
+            next_stage_id,
+        )
+
+        # Submit to next stage
+        for next_input in next_inputs:
+            await self._add_request_to_stage(
+                next_stage_id,
+                req_id,
+                next_input,
+                req_state.sampling_params_list[next_stage_id],
+            )
+
+
+    async def _get_stage_output(self, stage_id: int) -> list[Any]:
+        """Pull and process outputs from a single stage."""
+        stage_client = self.stage_clients[stage_id]
+        stage_output_processor = self.output_processors[stage_id]
+
+        outputs = await stage_client.get_output_async()
+
+        processed = stage_output_processor.process_outputs(
+            outputs.outputs,
+            getattr(outputs, "timestamp", None),
+            None,
+        )
+
+        if getattr(processed, "reqs_to_abort", None):
+            await stage_client.abort_requests_async(processed.reqs_to_abort)
+
+        try:
+            if hasattr(outputs, "scheduler_stats"):
+                stage_output_processor.update_scheduler_stats(
+                    outputs.scheduler_stats
+                )
+        except Exception:
+            pass
+
+        return list(getattr(processed, "request_outputs", []) or [])
+
+    async def _add_request_to_stage(
+        self,
+        stage_id: int,
+        request_id: str,
+        prompt: Any,
+        params: Any,
+        arrival_time: float | None = None,
+    ) -> None:
+        """Process input and submit a request to a specific stage."""
+        stage_client = self.stage_clients[stage_id]
+        stage_input_processor = self.input_processors[stage_id]
+        stage_output_processor = self.output_processors[stage_id]
+
+        # Inject global_request_id
+        def _inject_global_id(target_ein: Any) -> None:
+            if isinstance(target_ein, dict):
+                if "additional_information" not in target_ein:
+                    target_ein["additional_information"] = {}
+                if target_ein["additional_information"] is None:
+                    target_ein["additional_information"] = {}
+                if isinstance(target_ein["additional_information"], dict):
+                    target_ein["additional_information"][
+                        "global_request_id"
+                    ] = [str(request_id)]
+
+
+        if isinstance(prompt, dict):
+            _inject_global_id(prompt)
+        elif isinstance(prompt, list):
+            for item in prompt:
+                _inject_global_id(item)
+
+        # Check connector
+        if stage_id > 0 and self.connectors:
+            connector_key = (str(stage_id - 1), str(stage_id))
+            connector = self.connectors.get(connector_key)
+            if connector:
+                logger.debug(
+                    "[Orchestrator] Stage %s checking connector from stage %s",
+                    stage_id,
+                    stage_id - 1,
+                )
+
+        # Process inputs
+        prompt_text: str | None = None
+        if not isinstance(prompt, EngineCoreRequest):
+            if stage_input_processor is None:
+                raise ValueError(
+                    f"Stage {stage_id} has no input processor"
+                )
+            processed = stage_input_processor.process_inputs(
+                request_id=request_id,
+                prompt=prompt,
+                params=params,
+                arrival_time=arrival_time,
+            )
+            if isinstance(processed, tuple) and len(processed) == 2:
+                prompt_text, request = processed
+            else:
+                request = processed
+                prompt_text = prompt
+        else:
+            request = prompt
+
+        stage_input_processor.assign_request_id(request)
+        request.request_id = request_id
+
+        stage_output_processor.add_request(
+            request=request,
+            prompt=prompt_text,
+            parent_req=None,
+            request_index=0,
+            queue=None,
+        )
+
+        await stage_client.add_request_async(request)
+
+        if self.log_requests:
+            logger.info(
+                "[Orchestrator] Added request %s to stage %s",
+                request_id,
+                stage_id,
+            )
+
+
+    async def _handle_add_request(self, msg: dict[str, Any]) -> None:
+        """Handle an add_request message from the main process."""
+        stage_id = msg["stage_id"]
+        request_id = msg["request_id"]
+        prompt = msg["prompt"]
+        params = msg["params"]
+        sampling_params_list = msg["sampling_params_list"]
+        final_stage_id = msg["final_stage_id"]
+
+        # Track request state
+        self.request_states[request_id] = _OrchestratorRequestState(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+        )
+
+        await self._add_request_to_stage(stage_id, request_id, prompt, params)
+
+    async def _handle_abort(self, msg: dict[str, Any]) -> None:
+        """Handle an abort message from the main process."""
+        request_ids = msg["request_ids"]
+        for stage_id in range(self.num_stages):
+            await self.stage_clients[stage_id].abort_requests_async(request_ids)
+        for req_id in request_ids:
+            self.request_states.pop(req_id, None)
+        logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+
+    def _shutdown_stages(self) -> None:
+        """Shutdown all stage clients."""
+        logger.info("[Orchestrator] Shutting down all stages")
+        for stage_id, stage_client in enumerate(self.stage_clients):
+            try:
+                stage_client.shutdown()
+                logger.info(f"[Orchestrator] Stage {stage_id} shut down")
+            except Exception as e:
+                logger.warning(
+                    f"[Orchestrator] Failed to shutdown stage {stage_id}: {e}"
+                )
+
+
+
+
+def _run_orchestrator_process(
+    model: str,
+    stage_configs: Any,
+    request_queue: mp.Queue,
+    output_queue: mp.Queue,
+    stage_init_timeout: int,
+    log_requests: bool,
+) -> None:
+    """Top-level entry point for the Orchestrator child process.
+
+    Creates a fresh asyncio event loop and runs the _Orchestrator.
+    """
+    try:
+        orchestrator = _Orchestrator(
+            model=model,
+            stage_configs=stage_configs,
+            request_queue=request_queue,
+            output_queue=output_queue,
+            stage_init_timeout=stage_init_timeout,
+            log_requests=log_requests,
+        )
+        asyncio.run(orchestrator.run())
+    except Exception:
+        logger.exception("[Orchestrator] Process crashed")
+        # Signal the main process so it doesn't hang waiting for ready
+        try:
+            output_queue.put({"type": "error", "error": "Orchestrator process crashed"})
+        except Exception:
+            pass
+        raise
+
+
+# ============================================================
+# AsyncOmniEngine — thin proxy in the main process
+# ============================================================
+
+
+
+class AsyncOmniEngine:
+    """Thin proxy that launches an Orchestrator child process.
+
+    All stage clients, input/output processors, and stage-to-stage transfer
+    logic live inside the Orchestrator process. This class communicates with
+    it via two mp.Queues (request_queue and output_queue).
 
     Args:
         model: Model name or path
         stage_configs: List of stage configurations. If None, loads from model.
-        stage_configs_path: Path to YAML file with stage configs. If None, loads from model.
+        stage_configs_path: Path to YAML file with stage configs.
         stage_init_timeout: Timeout for stage initialization (seconds)
         log_requests: Whether to log requests
         **kwargs: Additional arguments
@@ -67,172 +549,101 @@ class AsyncOmniEngine:
         logger.info(f"[AsyncOmniEngine] stage_init_timeout: {stage_init_timeout}")
         logger.info(f"[AsyncOmniEngine] log_requests: {log_requests}")
         logger.info(f"[AsyncOmniEngine] kwargs: {kwargs}")
-        ### base engine args
-        tokenizer = kwargs.get("tokenizer", None)
 
-        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
-        # Load stage configurations from YAML
+        # --- Resolve stage configs (same logic as before) ---
+        tokenizer = kwargs.get("tokenizer", None)
+        base_engine_args = (
+            {"tokenizer": tokenizer} if tokenizer is not None else None
+        )
+
         if stage_configs_path is None:
             self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
-            if not self.stage_configs:
-                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
-                self.stage_configs = OmegaConf.create(default_stage_cfg)
+            resolved_configs = load_stage_configs_from_model(
+                model, base_engine_args=base_engine_args
+            )
+            if not resolved_configs:
+                default_stage_cfg = self._create_default_diffusion_stage_cfg(
+                    kwargs
+                )
+                resolved_configs = OmegaConf.create(default_stage_cfg)
         else:
             self.config_path = stage_configs_path
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+            resolved_configs = load_stage_configs_from_yaml(
+                stage_configs_path, base_engine_args=base_engine_args
+            )
 
+
+        self.stage_configs = resolved_configs
         self.num_stages = len(self.stage_configs)
 
         logger.info(
-            f"[AsyncOmniEngine] Initializing with {self.num_stages} stages for model {model}"
+            f"[AsyncOmniEngine] Launching Orchestrator process with "
+            f"{self.num_stages} stages"
         )
 
-        # Initialize stage clients
-        self.stage_clients: list[StageAsyncCoreClient] = []
-        self.stage_input_processors: list[OmniInputProcessor] = []
-        self.stage_output_processors: list[MultimodalOutputProcessor] = []
-        self.stage_tokenizers: list[TokenizerLike] = []
-        self.stage_vllm_configs: list[VllmConfig] = []
+        # Create IPC queues
+        self.request_queue: mp.Queue = mp.Queue()
+        self.output_queue: mp.Queue = mp.Queue()
 
-        # Initialize connectors (for cross-stage data transfer like KV cache)
-        self.connectors: dict[tuple[str, str], Any] = {}
+        # Launch orchestrator child process
+        self.orchestrator_proc = mp.Process(
+            target=_run_orchestrator_process,
+            args=(
+                model,
+                self.stage_configs,
+                self.request_queue,
+                self.output_queue,
+                stage_init_timeout,
+                log_requests,
+            ),
+            daemon=True,
+        )
+        self.orchestrator_proc.start()
 
-        self._initialize_stages()
-        self._initialize_connectors()
-
-        logger.info(f"[AsyncOmniEngine] Initialization complete")
-
-    def _initialize_stages(self) -> None:
-        """Initialize all stage clients and their processors."""
-        for stage_id, stage_cfg in enumerate(self.stage_configs):
-            logger.info(f"[AsyncOmniEngine] Initializing stage {stage_id}")
-
-            # Create stage client
-            stage_client = StageAsyncCoreClient(
-                stage_config=stage_cfg,
-                model=self.model,
-                stage_init_timeout=self.stage_init_timeout,
-            )
-
-            # Get vllm_config from EngineCoreClient (available after StageAsyncCoreClient init).
-            vllm_config = stage_client.vllm_config
-
-            # Initialize tokenizer the same way as AsyncOmniLLM.
-            # If skip_tokenizer_init is enabled, tokenizer is intentionally omitted.
-            if vllm_config.model_config.skip_tokenizer_init:
-                tokenizer = None
-            else:
-                tokenizer = cached_tokenizer_from_config(
-                    model_config=vllm_config.model_config
-                )
-
-            # Determine engine output type
-            engine_output_type = getattr(
-                stage_cfg.engine_args, "engine_output_type", None
-            )
-
-            # Create input processor
-            stage_input_processor = OmniInputProcessor(
-                vllm_config=vllm_config,
-                tokenizer=tokenizer,
-            )
-
-            # Create output processor
-            stage_output_processor = MultimodalOutputProcessor(
-                tokenizer=tokenizer,
-                log_stats=False,
-                engine_core_output_type=engine_output_type,
-            )
-
-            # Store references
-            self.stage_clients.append(stage_client)
-            self.stage_input_processors.append(stage_input_processor)
-            self.stage_output_processors.append(stage_output_processor)
-            self.stage_tokenizers.append(tokenizer)
-            self.stage_vllm_configs.append(vllm_config)
-
-            logger.info(f"[AsyncOmniEngine] Stage {stage_id} initialized")
-
-    def _initialize_connectors(self) -> None:
-        """Initialize connectors for cross-stage data transfer.
-
-        Connectors are used for efficient data transfer between stages,
-        such as KV cache transfer, shared memory communication, etc.
-        """
+        # Wait for ready signal from orchestrator
+        logger.info("[AsyncOmniEngine] Waiting for Orchestrator ready signal")
         try:
-            from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
-            from vllm_omni.entrypoints.utils import resolve_model_config_path
-
-            config_path = resolve_model_config_path(self.model)
-
-            # Initialize connectors with default settings
-            omni_transfer_config, connectors = initialize_orchestrator_connectors(
-                config_path,
-                worker_backend="multi_process",
-                shm_threshold_bytes=65536,
+            ready_msg = self.output_queue.get(timeout=stage_init_timeout)
+        except queue.Empty:
+            raise TimeoutError(
+                f"Orchestrator did not become ready within "
+                f"{stage_init_timeout}s"
             )
 
-            self.omni_transfer_config = omni_transfer_config
-            self.connectors = connectors
-
-            if connectors:
-                logger.info(
-                    f"[AsyncOmniEngine] Initialized {len(connectors)} connectors for cross-stage transfer"
-                )
-            else:
-                logger.debug("[AsyncOmniEngine] No connectors configured")
-
-        except Exception as e:
-            logger.warning(f"[AsyncOmniEngine] Failed to initialize connectors: {e}")
-            self.omni_transfer_config = None
-            self.connectors = {}
-
-    # ==================== Stage Access Methods ====================
-
-    def get_stage_client(self, stage_id: int) -> StageAsyncCoreClient:
-        """Get the stage client for a specific stage."""
-        if stage_id < 0 or stage_id >= self.num_stages:
-            raise ValueError(
-                f"Invalid stage_id {stage_id}, must be in [0, {self.num_stages})"
+        if ready_msg.get("type") == "error":
+            raise RuntimeError(
+                f"Orchestrator failed to start: {ready_msg.get('error')}"
             )
-        return self.stage_clients[stage_id]
 
-    def get_stage_input_processor(self, stage_id: int) -> OmniInputProcessor:
-        """Get the input processor for a specific stage."""
-        if stage_id < 0 or stage_id >= self.num_stages:
-            raise ValueError(
-                f"Invalid stage_id {stage_id}, must be in [0, {self.num_stages})"
-            )
-        return self.stage_input_processors[stage_id]
+        assert ready_msg["type"] == "ready", (
+            f"Expected ready message, got {ready_msg['type']}"
+        )
 
-    def get_stage_output_processor(
-        self, stage_id: int
-    ) -> MultimodalOutputProcessor:
-        """Get the output processor for a specific stage."""
-        if stage_id < 0 or stage_id >= self.num_stages:
-            raise ValueError(
-                f"Invalid stage_id {stage_id}, must be in [0, {self.num_stages})"
-            )
-        return self.stage_output_processors[stage_id]
+        self.num_stages = ready_msg["num_stages"]
+        self.default_sampling_params_list = ready_msg[
+            "default_sampling_params_list"
+        ]
+        self.stage_metadata = ready_msg["stage_metadata"]
 
-    def get_stage_tokenizer(self, stage_id: int) -> TokenizerLike:
-        """Get the tokenizer for a specific stage."""
-        if stage_id < 0 or stage_id >= self.num_stages:
-            raise ValueError(
-                f"Invalid stage_id {stage_id}, must be in [0, {self.num_stages})"
-            )
-        return self.stage_tokenizers[stage_id]
+        logger.info(
+            f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages"
+        )
 
-    def get_stage_vllm_config(self, stage_id: int) -> VllmConfig:
-        """Get the vllm config for a specific stage."""
-        if stage_id < 0 or stage_id >= self.num_stages:
-            raise ValueError(
-                f"Invalid stage_id {stage_id}, must be in [0, {self.num_stages})"
-            )
-        return self.stage_vllm_configs[stage_id]
 
-    # ==================== Add Request Methods ====================
+    @staticmethod
+    def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list:
+        """Create a default single-stage diffusion config from kwargs."""
+        return [
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "engine_args": kwargs,
+                "final_output": True,
+                "final_output_type": "image",
+            }
+        ]
+
+    # ==================== Public API (proxy to Orchestrator) ====================
 
     async def add_request(
         self,
@@ -240,6 +651,8 @@ class AsyncOmniEngine:
         request_id: str,
         prompt: EngineCoreRequest | PromptType,
         params: SamplingParams | PoolingParams,
+        sampling_params_list: list[Any] | None = None,
+        final_stage_id: int = 0,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -247,214 +660,58 @@ class AsyncOmniEngine:
         priority: int = 0,
         prompt_text: str | None = None,
     ) -> None:
-        """Add a request to a specific stage.
+        """Send an add_request message to the Orchestrator."""
+        self.request_queue.put({
+            "type": "add_request",
+            "stage_id": stage_id,
+            "request_id": request_id,
+            "prompt": prompt,
+            "params": params,
+            "sampling_params_list": sampling_params_list or [],
+            "final_stage_id": final_stage_id,
+        })
 
-        This method handles:
-        1. Injecting global_request_id into additional_information
-        2. Processing connector data if available
-        3. Processing inputs through input_processor
-        4. Adding request to the stage client
-
-        Args:
-            stage_id: Stage to add the request to
-            request_id: Unique identifier for the request
-            prompt: Input prompt (can be EngineCoreRequest or PromptType)
-            params: Sampling or pooling parameters
-            arrival_time: Request arrival time
-            lora_request: Optional LoRA request
-            tokenization_kwargs: Optional tokenization arguments
-            trace_headers: Optional trace headers
-            priority: Request priority
-            prompt_text: Optional prompt text
-        """
-        stage_client = self.get_stage_client(stage_id)
-        stage_input_processor = self.get_stage_input_processor(stage_id)
-        stage_output_processor = self.get_stage_output_processor(stage_id)
-
-        # Step 1: Inject global_request_id into additional_information
-        # This allows workers to use the global ID for cross-stage operations like KV transfer
-        def _inject_global_id(target_ein):
-            """Inject global request ID into engine inputs."""
-            if isinstance(target_ein, dict):
-                if "additional_information" not in target_ein:
-                    target_ein["additional_information"] = {}
-
-                if target_ein["additional_information"] is None:
-                    target_ein["additional_information"] = {}
-
-                if isinstance(target_ein["additional_information"], dict):
-                    # Wrap in list because OmniInputProcessor requires Tensor or list values
-                    target_ein["additional_information"]["global_request_id"] = [str(request_id)]
-
-        # Inject global_request_id if prompt is dict-like
-        if isinstance(prompt, dict):
-            _inject_global_id(prompt)
-        elif isinstance(prompt, list):
-            for item in prompt:
-                _inject_global_id(item)
-
-        # Step 2: Check if we need to receive data from connector
-        # For stages > 0, we might need to receive KV cache or other data from upstream stages
-        if stage_id > 0 and hasattr(self, 'connectors') and self.connectors:
-            # Check if there's a connector for the edge (prev_stage -> this_stage)
-            prev_stage_id = stage_id - 1
-            connector_key = (str(prev_stage_id), str(stage_id))
-            connector = self.connectors.get(connector_key)
-
-            if connector:
-                try:
-                    # Try to receive data from connector
-                    # This is typically KV cache data for cross-stage transfer
-                    logger.debug(
-                        f"[AsyncOmniEngine] Stage {stage_id} checking connector "
-                        f"for data from stage {prev_stage_id}"
-                    )
-                    # Note: Connector receive is typically handled in the worker process
-                    # Here we just log that a connector exists
-                except Exception as e:
-                    logger.warning(
-                        f"[AsyncOmniEngine] Failed to process connector data for stage {stage_id}: {e}"
-                    )
-
-        # Step 3: Process inputs if needed
-        if not isinstance(prompt, EngineCoreRequest):
-            if stage_input_processor is None:
-                raise ValueError(
-                    f"Stage {stage_id} has no input processor, "
-                    "cannot process non-EngineCoreRequest prompts"
-                )
-            if prompt_text is not None:
-                # Keep consistent with vLLM AsyncLLM: prompt_text is only accepted
-                # when passing an EngineCoreRequest directly.
-                raise ValueError("should only provide prompt_text with EngineCoreRequest")
-
-            processed = stage_input_processor.process_inputs(
-                request_id=request_id,
-                prompt=prompt,
-                params=params,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-            )
-
-            # Our OmniInputProcessor implementation may return either:
-            # - EngineCoreRequest (vLLM style), or
-            # - (prompt_str, EngineCoreRequest) (legacy omni style).
-            if isinstance(processed, tuple) and len(processed) == 2:
-                prompt_text_from_proc, request = processed
-                prompt_text = prompt_text_from_proc
-            else:
-                request = processed
-                prompt_text = prompt
-        else:
-            request = prompt
-
-        # Align with vLLM AsyncLLM: assign a stable internal request id and ensure
-        # request.external_req_id is set (OutputProcessor requires it).
-        stage_input_processor.assign_request_id(request)
-        # TODO: hack here
-        request.request_id = request_id
-
-        # Step 4: Register request in OutputProcessor (this process) so that
-        # EngineCoreOutputs can be converted to RequestOutput via process_outputs().
-        # Must be done before EngineCore starts returning outputs.
-        stage_output_processor.add_request(
-            request=request,
-            prompt=prompt_text,
-            parent_req=None,
-            request_index=0,
-            queue=None,
-        )
-
-        # Step 5: Add request to stage client (EngineCore, separate process)
-        await stage_client.add_request_async(request)
-
-        if self.log_requests:
-            logger.info(f"[AsyncOmniEngine] Added request {request_id} to stage {stage_id}")
-
-    async def get_output_async(self, stage_id: int) -> list[Any]:
-        """Get processed outputs for a stage.
-
-        Pulls EngineCoreOutputs from the stage (EngineCoreClient), then runs the
-        stage's OutputProcessor to convert them into RequestOutput objects.
-
-        This mirrors vLLM's AsyncLLM output_handler behavior, but scoped per stage.
-        """
-        stage_client = self.get_stage_client(stage_id)
-        stage_output_processor = self.get_stage_output_processor(stage_id)
-
-        # 1) Pull EngineCoreOutputs from EngineCore.
-        outputs = await stage_client.get_output_async()
-
-        # 2) Process EngineCoreOutputs -> RequestOutput.
-        processed = stage_output_processor.process_outputs(
-            outputs.outputs,  # type: ignore[arg-type]
-            getattr(outputs, "timestamp", None),
-            None,
-        )
-
-        # 3) Abort any reqs that finished due to stop strings.
-        if getattr(processed, "reqs_to_abort", None):
-            await stage_client.abort_requests_async(processed.reqs_to_abort)
-
-        # Best-effort: propagate scheduler stats if available.
+    def try_get_output(self) -> dict[str, Any] | None:
+        """Non-blocking read from the Orchestrator output_queue."""
         try:
-            if hasattr(outputs, "scheduler_stats"):
-                stage_output_processor.update_scheduler_stats(outputs.scheduler_stats)
-        except Exception:
-            pass
+            return self.output_queue.get_nowait()
+        except queue.Empty:
+            return None
 
-        return list(getattr(processed, "request_outputs", []) or [])
+    def try_get_output_blocking(self, timeout: float = 0.05) -> dict[str, Any] | None:
+        """Blocking read from the Orchestrator output_queue with timeout."""
+        try:
+            return self.output_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
-    # ==================== Multi-Stage Orchestration Methods ====================
+    def get_stage_metadata(self, stage_id: int) -> dict[str, Any]:
+        """Get cached metadata for a stage."""
+        return self.stage_metadata[stage_id]
 
-    def set_stage_engine_outputs(self, stage_id: int, engine_outputs: Any) -> None:
-        """Set engine outputs for a stage (for cross-stage data flow).
-
-        Args:
-            stage_id: Stage to set outputs for
-            engine_outputs: Outputs to set
-        """
-        stage_client = self.get_stage_client(stage_id)
-        stage_client.set_engine_outputs(engine_outputs)
-
-    def process_stage_engine_inputs(
-        self,
-        stage_id: int,
-        stage_list: list[Any],
-        prompt: Any = None,
-    ) -> list[Any]:
-        """Process engine inputs for a stage from upstream stages.
-
-        Args:
-            stage_id: Stage to process inputs for
-            stage_list: List of all stage clients
-            prompt: Optional original prompt
-
-        Returns:
-            Processed inputs for the stage
-        """
-        stage_client = self.get_stage_client(stage_id)
-        return stage_client.process_engine_inputs(stage_list, prompt)
-
-    # ==================== Shutdown ====================
+    async def abort(self, request_ids: list[str]) -> None:
+        """Send abort message to the Orchestrator."""
+        self.request_queue.put({
+            "type": "abort",
+            "request_ids": request_ids,
+        })
 
     def shutdown(self) -> None:
-        """Shutdown all stage clients."""
-        logger.info("[AsyncOmniEngine] Shutting down all stages")
-        for stage_id, stage_client in enumerate(self.stage_clients):
-            try:
-                stage_client.shutdown()
-                logger.info(f"[AsyncOmniEngine] Stage {stage_id} shut down")
-            except Exception as e:
+        """Send shutdown message and wait for the Orchestrator to exit."""
+        logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
+        try:
+            self.request_queue.put({"type": "shutdown"})
+        except Exception:
+            pass
+        if hasattr(self, "orchestrator_proc") and self.orchestrator_proc.is_alive():
+            self.orchestrator_proc.join(timeout=10)
+            if self.orchestrator_proc.is_alive():
                 logger.warning(
-                    f"[AsyncOmniEngine] Failed to shutdown stage {stage_id}: {e}"
+                    "[AsyncOmniEngine] Orchestrator did not exit, terminating"
                 )
+                self.orchestrator_proc.terminate()
 
-    def __del__(self):
-        """Cleanup on deletion."""
+    def __del__(self) -> None:
         try:
             self.shutdown()
         except Exception:

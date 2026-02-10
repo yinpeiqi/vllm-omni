@@ -332,8 +332,6 @@ class StageAsyncCoreClient(AsyncMPClient):
         self, request: EngineCoreRequest | dict[str, Any]
     ) -> None:
         """Add request - supports both EngineCoreRequest and task dict."""
-        if isinstance(request, dict):
-            request = self._task_to_request(request)
         logger.info(
             f"[StageAsyncCoreClient] Stage-{self.stage_id} adding request: {request}"
         )
@@ -390,39 +388,3 @@ class StageAsyncCoreClient(AsyncMPClient):
             )
             for so in source_outputs
         ]
-
-    # ==================== Internal ====================
-
-    def _task_to_request(self, task: dict[str, Any]) -> EngineCoreRequest:
-        """Convert task dict to EngineCoreRequest."""
-        request_id = str(task.get("request_id", ""))
-        engine_inputs = task.get("engine_inputs", {})
-        sampling_params = task.get("sampling_params", self.default_sampling_params)
-
-        # Extract from engine_inputs
-        if isinstance(engine_inputs, dict):
-            prompt_token_ids = engine_inputs.get("prompt_token_ids")
-            mm_features = engine_inputs.get("mm_features")
-            prompt_embeds = engine_inputs.get("prompt_embeds")
-        elif hasattr(engine_inputs, "prompt_token_ids"):
-            prompt_token_ids = engine_inputs.prompt_token_ids
-            mm_features = getattr(engine_inputs, "mm_features", None)
-            prompt_embeds = getattr(engine_inputs, "prompt_embeds", None)
-        else:
-            prompt_token_ids = None
-            mm_features = None
-            prompt_embeds = None
-
-        return EngineCoreRequest(
-            request_id=request_id,
-            prompt_token_ids=prompt_token_ids,
-            mm_features=mm_features,
-            sampling_params=sampling_params,
-            pooling_params=None,
-            eos_token_id=None,
-            arrival_time=time.time(),
-            lora_request=None,
-            cache_salt=None,
-            data_parallel_rank=None,
-            prompt_embeds=prompt_embeds,
-        )

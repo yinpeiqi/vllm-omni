@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import types
 from collections.abc import AsyncGenerator, Iterable, Sequence
 from dataclasses import asdict
 from pprint import pformat
@@ -91,7 +92,7 @@ class AsyncOmniV1(EngineClient):
         logger.info(f"[AsyncOmniV1] async_chunk: {async_chunk}")
         logger.info(f"[AsyncOmniV1] output_modalities: {output_modalities}")
         logger.info(f"[AsyncOmniV1] kwargs: {kwargs}")
-        # Initialize AsyncOmniEngine
+        # Initialize AsyncOmniEngine (launches Orchestrator child process)
         self.engine = AsyncOmniEngine(
             model=model,
             stage_configs=stage_configs,
@@ -109,11 +110,8 @@ class AsyncOmniV1(EngineClient):
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
 
-        # Get default sampling params from stages
-        self.default_sampling_params_list = [
-            self.engine.get_stage_client(i).default_sampling_params
-            for i in range(self.engine.num_stages)
-        ]
+        # Get default sampling params from the Orchestrator ready message
+        self.default_sampling_params_list = self.engine.default_sampling_params_list
 
         logger.info(
             f"[AsyncOmniV1] Initialized with {self.engine.num_stages} stages for model {model}"
@@ -187,10 +185,16 @@ class AsyncOmniV1(EngineClient):
             req_start_ts: dict[int, float] = {}
 
             # Determine the final stage for E2E stats
+            # Use stage_metadata from the Orchestrator instead of direct stage_client access
+            # Wrap dicts in SimpleNamespace so getattr() works in get_final_stage_id_for_e2e
+            stage_meta_list = [
+                types.SimpleNamespace(**self.engine.get_stage_metadata(i))
+                for i in range(self.num_stages)
+            ]
             final_stage_id_for_e2e = get_final_stage_id_for_e2e(
                 output_modalities,
                 self.output_modalities,
-                [self.engine.get_stage_client(i) for i in range(self.num_stages)],
+                stage_meta_list,
             )
 
             # Create metrics tracker
@@ -205,13 +209,15 @@ class AsyncOmniV1(EngineClient):
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
 
-            # Add request to stage 0
+            # Add request to stage 0 (Orchestrator handles all stage transitions)
             logger.info("[AsyncOmniV1] submit request %s to stage-0", request_id)
             await self.engine.add_request(
                 stage_id=0,
                 request_id=request_id,
                 prompt=prompt,
                 params=sampling_params_list[0],
+                sampling_params_list=list(sampling_params_list),
+                final_stage_id=final_stage_id_for_e2e,
             )
             metrics.stage_first_ts[0] = time.time()
             req_start_ts[request_id] = time.time()
@@ -224,31 +230,20 @@ class AsyncOmniV1(EngineClient):
 
             # Process results based on mode
             if self.async_chunk:
-                # Async chunk mode: parallel stage execution
-                stage_queues = {stage_id: asyncio.Queue() for stage_id in range(self.num_stages)}
-                req_state.stage_queues = stage_queues
-                async for output in self._process_async_results(
-                    request_id,
-                    prompt,
-                    sampling_params_list,
-                    req_state,
-                    metrics,
-                    final_stage_id_for_e2e,
-                    req_start_ts,
-                    wall_start_ts,
-                ):
-                    yield output
+                # Async chunk mode: not yet supported with Orchestrator process
+                raise NotImplementedError(
+                    "async_chunk mode is not yet supported with the Orchestrator "
+                    "process architecture. Use async_chunk=False."
+                )
             else:
-                # Sequential mode: stages execute one after another
-                async for output in self._process_sequential_results(
+                # Sequential mode: Orchestrator handles stage transitions.
+                # We just read results from the queue.
+                async for output in self._process_orchestrator_results(
                     request_id,
-                    req_state,
                     metrics,
                     final_stage_id_for_e2e,
                     req_start_ts,
                     wall_start_ts,
-                    sampling_params_list,
-                    prompt,
                 ):
                     yield output
 
@@ -288,147 +283,61 @@ class AsyncOmniV1(EngineClient):
 
     # ==================== Processing Methods ====================
 
-    async def _process_sequential_results(
+    async def _process_orchestrator_results(
         self,
         request_id: str,
-        req_state: ClientRequestState,
-        metrics: OrchestratorMetrics,
-        final_stage_id_for_e2e: int,
-        req_start_ts: dict[int, float],
-        wall_start_ts: float,
-        sampling_params_list: list[OmniSamplingParams],
-        prompt: Any,
-    ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Process results sequentially: stage 0 → stage 1 → stage 2 → ..."""
-        for stage_id in range(final_stage_id_for_e2e + 1):
-            finished = False
-            while not finished:
-                # Wait for result from this stage
-                logger.debug(
-                    "[AsyncOmniV1] req=%s stage-%s waiting for output (queue size=%s)",
-                    request_id,
-                    stage_id,
-                    getattr(req_state.queue, "qsize", lambda: "NA")(),
-                )
-                result = await req_state.queue.get()
-                assert stage_id == req_state.stage_id
-                logger.debug(
-                    "[AsyncOmniV1] req=%s stage-%s got output result keys=%s",
-                    request_id,
-                    stage_id,
-                    list(result.keys()) if isinstance(result, dict) else type(result),
-                )
-
-                # Process the result
-                engine_outputs, finished, output_to_yield = self._process_single_result(
-                    result,
-                    stage_id,
-                    metrics,
-                    req_start_ts,
-                    wall_start_ts,
-                    final_stage_id_for_e2e,
-                )
-
-                if output_to_yield:
-                    logger.debug(
-                        "[AsyncOmniV1] req=%s stage-%s yielding final_output_type=%s finished=%s",
-                        request_id,
-                        stage_id,
-                        getattr(output_to_yield, "final_output_type", None),
-                        getattr(getattr(output_to_yield, "request_output", None), "finished", None),
-                    )
-                    yield output_to_yield
-
-            # Stage finished, prepare next stage
-            logger.info("[AsyncOmniV1] req=%s stage-%s finished; preparing forward", request_id, stage_id)
-            if not isinstance(engine_outputs, list):
-                engine_outputs = [engine_outputs]
-
-            # Set outputs for cross-stage data flow
-            self.engine.set_stage_engine_outputs(stage_id, engine_outputs)
-
-            # Forward to next stage if there is one
-            next_stage_id = stage_id + 1
-            if next_stage_id <= final_stage_id_for_e2e:
-                # Process inputs for next stage from current stage outputs
-                logger.info("[AsyncOmniV1] req=%s forwarding stage-%s -> stage-%s", request_id, stage_id, next_stage_id)
-                next_inputs = self.engine.process_stage_engine_inputs(
-                    stage_id=next_stage_id,
-                    stage_list=[self.engine.get_stage_client(i) for i in range(self.num_stages)],
-                    prompt=prompt,
-                )
-                logger.info(
-                    "[AsyncOmniV1] req=%s computed %d next_inputs for stage-%s",
-                    request_id,
-                    len(next_inputs),
-                    next_stage_id,
-                )
-
-                # Add request to next stage
-                for next_input in next_inputs:
-                    logger.debug(
-                        "[AsyncOmniV1] req=%s submit to stage-%s prompt_type=%s",
-                        request_id,
-                        next_stage_id,
-                        type(next_input),
-                    )
-                    await self.engine.add_request(
-                        stage_id=next_stage_id,
-                        request_id=request_id,
-                        prompt=next_input,
-                        params=sampling_params_list[next_stage_id],
-                    )
-                    metrics.stage_first_ts[next_stage_id] = time.time()
-
-                logger.debug(f"[AsyncOmniV1] Forwarded request {request_id} to stage {next_stage_id}")
-
-    async def _process_async_results(
-        self,
-        request_id: str,
-        prompt: Any,
-        sampling_params_list: list[OmniSamplingParams],
-        req_state: ClientRequestState,
         metrics: OrchestratorMetrics,
         final_stage_id_for_e2e: int,
         req_start_ts: dict[int, float],
         wall_start_ts: float,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Process results asynchronously: stages can run in parallel."""
-        all_stages_finished = {stage_id: False for stage_id in range(final_stage_id_for_e2e + 1)}
-        submit_flag = True
+        """Read results from the Orchestrator (via the request's asyncio.Queue)
+        and yield OmniRequestOutput objects.
 
-        while not all(all_stages_finished.values()):
-            for stage_id in range(final_stage_id_for_e2e + 1):
-                if all_stages_finished[stage_id]:
-                    continue
+        The Orchestrator handles all stage-to-stage transfers. This method
+        only processes final outputs that arrive on the per-request queue.
+        """
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            return
 
-                try:
-                    result = req_state.stage_queues[stage_id].get_nowait()
-                except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.001)
-                    continue
+        while True:
+            result = await req_state.queue.get()
 
-                # Process the result
-                engine_outputs, finished, output_to_yield = self._process_single_result(
-                    result,
+            stage_id = result.get("stage_id", 0)
+
+            # Check for errors
+            if "error" in result:
+                logger.error(
+                    "[AsyncOmniV1] Orchestrator error for req=%s stage-%s: %s",
+                    request_id,
                     stage_id,
-                    metrics,
-                    req_start_ts,
-                    wall_start_ts,
-                    final_stage_id_for_e2e,
+                    result["error"],
                 )
+                raise RuntimeError(result)
 
-                # Submit to all downstream stages on first output from stage 0
-                if submit_flag and stage_id == 0:
-                    submit_flag = False
-                    # TODO: Implement async chunk logic for parallel stage execution
-                    # This requires special handling of prompt token IDs
-                    pass
+            # Process the result (constructs OmniRequestOutput)
+            engine_outputs, finished, output_to_yield = self._process_single_result(
+                result,
+                stage_id,
+                metrics,
+                req_start_ts,
+                wall_start_ts,
+                final_stage_id_for_e2e,
+            )
 
-                all_stages_finished[stage_id] = finished
+            if output_to_yield:
+                logger.debug(
+                    "[AsyncOmniV1] req=%s stage-%s yielding final_output_type=%s",
+                    request_id,
+                    stage_id,
+                    getattr(output_to_yield, "final_output_type", None),
+                )
+                yield output_to_yield
 
-                if output_to_yield:
-                    yield output_to_yield
+            # The Orchestrator sets "finished" when the final stage is done
+            if result.get("finished"):
+                break
 
     def _process_single_result(
         self,
@@ -475,11 +384,11 @@ class AsyncOmniV1(EngineClient):
 
         logger.debug(f"[AsyncOmniV1] Stage-{stage_id} completed request {req_id}")
 
-        # Determine if this is a final output stage
-        stage_client = self.engine.get_stage_client(stage_id)
+        # Determine if this is a final output stage (use cached metadata)
+        stage_meta = self.engine.get_stage_metadata(stage_id)
         output_to_yield = None
 
-        if stage_client.final_output:
+        if stage_meta["final_output"]:
             logger.debug(f"[AsyncOmniV1] Request {req_id} finalized at stage-{stage_id}")
 
             # Finalize request metrics
@@ -496,23 +405,23 @@ class AsyncOmniV1(EngineClient):
 
             # Construct output to yield
             images = []
-            if stage_client.final_output_type == "image":
+            if stage_meta["final_output_type"] == "image":
                 if isinstance(engine_outputs, OmniRequestOutput) and engine_outputs.images:
                     images = engine_outputs.images
                 elif hasattr(engine_outputs, "images") and engine_outputs.images:
                     images = engine_outputs.images
 
-            if stage_client.final_output_type == "image":
+            if stage_meta["final_output_type"] == "image":
                 output_to_yield = OmniRequestOutput(
                     stage_id=stage_id,
-                    final_output_type=stage_client.final_output_type,
+                    final_output_type=stage_meta["final_output_type"],
                     request_output=engine_outputs,
                     images=images,
                 )
             else:
                 output_to_yield = OmniRequestOutput(
                     stage_id=stage_id,
-                    final_output_type=stage_client.final_output_type,
+                    final_output_type=stage_meta["final_output_type"],
                     request_output=engine_outputs,
                 )
 
@@ -521,7 +430,11 @@ class AsyncOmniV1(EngineClient):
     # ==================== Output Handler ====================
 
     def _run_output_handler(self) -> None:
-        """Start the output handler if not already running."""
+        """Start the output handler if not already running.
+
+        The output handler reads results from the Orchestrator's output_queue
+        (via mp.Queue) and routes them to per-request asyncio.Queues.
+        """
         if self.output_handler is not None:
             return
 
@@ -529,91 +442,48 @@ class AsyncOmniV1(EngineClient):
         engine = self.engine
 
         async def output_handler():
-            """Background coroutine that collects outputs from all stages."""
+            """Background coroutine that reads from the Orchestrator output queue."""
+            loop = asyncio.get_event_loop()
             try:
                 while True:
-                    idle = True
+                    # Blocking read with timeout (runs in executor to avoid
+                    # blocking the event loop)
+                    msg = await loop.run_in_executor(
+                        None, engine.try_get_output_blocking
+                    )
+                    if msg is None:
+                        continue
 
-                    # Poll all stages for outputs
-                    for stage_id in range(engine.num_stages):
-                        # Try to get output from this stage (non-blocking).
-                        # NOTE: We pull EngineCoreOutputs from StageAsyncCoreClient inside
-                        # AsyncOmniEngine.get_output_async(stage_id), and run that stage's
-                        # OutputProcessor.process_outputs() to produce RequestOutput objects.
-                        try:
-                            request_outputs = await asyncio.wait_for(
-                                engine.get_output_async(stage_id),
-                                timeout=0.001,
-                            )
-                        except asyncio.TimeoutError:
-                            continue
-                        except Exception:
-                            logger.exception(
-                                "[AsyncOmniV1] output_handler get_output_async failed for stage-%s",
-                                stage_id,
-                            )
-                            raise
-
-                        if not request_outputs:
-                            continue
-
-                        idle = False
-                        logger.debug(
-                            "[AsyncOmniV1] output_handler stage-%s got %d outputs",
-                            stage_id,
-                            len(request_outputs),
+                    msg_type = msg.get("type")
+                    if msg_type != "output":
+                        logger.warning(
+                            "[AsyncOmniV1] output_handler got unexpected msg type: %s",
+                            msg_type,
                         )
+                        continue
 
-                        # Process each output
-                        for output in request_outputs:
-                            req_id = output.request_id
-                            req_state = request_states.get(req_id)
+                    req_id = msg.get("request_id")
+                    req_state = request_states.get(req_id)
 
-                            if req_state is None:
-                                logger.debug(list(request_states.keys()))
-                                logger.debug(
-                                    f"[AsyncOmniV1] Request may have been aborted; "
-                                    f"dropping output for req {req_id} at stage-{stage_id}"
-                                )
-                                continue
+                    if req_state is None:
+                        logger.debug(
+                            "[AsyncOmniV1] Dropping output for unknown req %s",
+                            req_id,
+                        )
+                        continue
 
-                            # Construct result dict
-                            result = {
-                                "request_id": req_id,
-                                "stage_id": stage_id,
-                                "engine_outputs": [output],
-                                "metrics": None,  # TODO: Add metrics
-                            }
+                    # Update stage_id on the request state
+                    req_state.stage_id = msg.get("stage_id", 0)
 
-                            # Put result into appropriate queue
-                            if hasattr(req_state, "stage_queues") and stage_id in req_state.stage_queues:
-                                await req_state.stage_queues[stage_id].put(result)
-                            else:
-                                await req_state.queue.put(result)
-                                req_state.stage_id = stage_id
-                                logger.debug(
-                                    "[AsyncOmniV1] output_handler enqueued req=%s stage-%s (queue size=%s)",
-                                    req_id,
-                                    stage_id,
-                                    getattr(req_state.queue, "qsize", lambda: "NA")(),
-                                )
-
-                    if idle:
-                        await asyncio.sleep(0.001)  # Avoid CPU overload when idle
-                    else:
-                        await asyncio.sleep(0)  # Yield to other coroutines
+                    # Route to the per-request queue
+                    await req_state.queue.put(msg)
 
             except Exception as e:
                 logger.exception("[AsyncOmniV1] output_handler failed.")
-                # Propagate error to all requests
                 for req_state in request_states.values():
                     error_msg = {"request_id": req_state.request_id, "error": str(e)}
-                    if hasattr(req_state, "stage_queues"):
-                        for queue in req_state.stage_queues.values():
-                            await queue.put(error_msg)
-                    else:
-                        await req_state.queue.put(error_msg)
-                self.output_handler = None  # Allow restart
+                    await req_state.queue.put(error_msg)
+                self.output_handler = None
 
         self.output_handler = asyncio.create_task(output_handler())
         logger.debug("[AsyncOmniV1] Output handler started")
@@ -621,13 +491,11 @@ class AsyncOmniV1(EngineClient):
     # ==================== Control Methods ====================
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
-        """Abort request(s)."""
+        """Abort request(s) via the Orchestrator."""
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
 
-        # Abort in all stages
-        for stage_id in range(self.engine.num_stages):
-            stage_client = self.engine.get_stage_client(stage_id)
-            await stage_client.abort_requests_async(request_ids)
+        # Send abort to Orchestrator (it will abort in all stages)
+        await self.engine.abort(request_ids)
 
         # Remove from request states
         for req_id in request_ids:
@@ -671,24 +539,32 @@ class AsyncOmniV1(EngineClient):
             return self._paused
 
     async def start_profile(self) -> None:
-        """Start profiling all stages."""
-        for stage_id in range(self.engine.num_stages):
-            await self.engine.get_stage_client(stage_id).profile_async(True)
+        """Start profiling all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmniV1] start_profile not yet supported with Orchestrator process")
 
     async def stop_profile(self) -> None:
-        """Stop profiling all stages."""
-        for stage_id in range(self.engine.num_stages):
-            await self.engine.get_stage_client(stage_id).profile_async(False)
+        """Stop profiling all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmniV1] stop_profile not yet supported with Orchestrator process")
 
     async def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache for all stages."""
-        for stage_id in range(self.engine.num_stages):
-            await self.engine.get_stage_client(stage_id).reset_mm_cache_async()
+        """Reset the multi-modal cache for all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmniV1] reset_mm_cache not yet supported with Orchestrator process")
 
     async def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache for all stages."""
-        for stage_id in range(self.engine.num_stages):
-            await self.engine.get_stage_client(stage_id).reset_encoder_cache_async()
+        """Reset the encoder cache for all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmniV1] reset_encoder_cache not yet supported with Orchestrator process")
 
     async def reset_prefix_cache(
         self,
@@ -697,41 +573,39 @@ class AsyncOmniV1(EngineClient):
     ) -> bool:
         """Reset the prefix cache for all stages.
 
-        Returns True if all stages report success.
+        TODO: Forward to Orchestrator process via message.
         """
-        ok = True
-        for stage_id in range(self.engine.num_stages):
-            stage_ok = await self.engine.get_stage_client(stage_id).reset_prefix_cache_async(
-                reset_running_requests=reset_running_requests,
-                reset_connector=reset_connector,
-            )
-            ok = ok and bool(stage_ok)
-        return ok
+        logger.warning("[AsyncOmniV1] reset_prefix_cache not yet supported with Orchestrator process")
+        return True
 
     async def sleep(self, level: int = 1) -> None:
-        """Sleep all stages."""
-        for stage_id in range(self.engine.num_stages):
-            await self.engine.get_stage_client(stage_id).sleep_async(level)
+        """Sleep all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmniV1] sleep not yet supported with Orchestrator process")
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
-        """Wake up all stages."""
-        for stage_id in range(self.engine.num_stages):
-            await self.engine.get_stage_client(stage_id).wake_up_async(tags)
+        """Wake up all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmniV1] wake_up not yet supported with Orchestrator process")
 
     async def is_sleeping(self) -> bool:
-        """Return whether all stages are sleeping."""
-        states = []
-        for stage_id in range(self.engine.num_stages):
-            states.append(await self.engine.get_stage_client(stage_id).is_sleeping_async())
-        return all(states) if states else False
+        """Return whether all stages are sleeping.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        return False
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
-        """Load a new LoRA adapter into all stages."""
-        ok = True
-        for stage_id in range(self.engine.num_stages):
-            stage_ok = await self.engine.get_stage_client(stage_id).add_lora_async(lora_request)
-            ok = ok and bool(stage_ok)
-        return ok
+        """Load a new LoRA adapter into all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmniV1] add_lora not yet supported with Orchestrator process")
+        return False
 
     # ==================== Properties ====================
 
@@ -747,8 +621,11 @@ class AsyncOmniV1(EngineClient):
 
     @property
     def errored(self) -> bool:
-        """Check if any stage has errored."""
-        return self.engine.errored
+        """Check if the Orchestrator process has died."""
+        return (
+            hasattr(self.engine, "orchestrator_proc")
+            and not self.engine.orchestrator_proc.is_alive()
+        )
 
     @property
     def dead_error(self) -> BaseException:
@@ -758,33 +635,45 @@ class AsyncOmniV1(EngineClient):
     # ==================== EngineClient Interface ====================
 
     async def get_vllm_config(self) -> VllmConfig:
-        """Get vllm config from the first stage."""
-        return self.engine.get_stage_vllm_config(0)
+        """Get vllm config.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        return None  # type: ignore[return-value]
 
     async def get_model_config(self) -> Any:
-        """Get model config from the first stage."""
-        vllm_config = await self.get_vllm_config()
-        return vllm_config.model_config if vllm_config else None
+        """Get model config.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        return None
 
     async def get_input_preprocessor(self) -> InputPreprocessor:
         """Get input preprocessor."""
         return None  # TODO: Implement if needed
 
     async def get_tokenizer(self) -> TokenizerLike:
-        """Get tokenizer from the first stage."""
-        return self.engine.get_stage_tokenizer(0)
+        """Get tokenizer.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        return None  # type: ignore[return-value]
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
-        return await self.engine.is_tracing_enabled()
+        return False
 
     async def do_log_stats(self) -> None:
-        """Log statistics."""
-        await self.engine.do_log_stats()
+        """Log statistics.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        pass
 
     async def check_health(self) -> None:
-        """Check engine health."""
-        await self.engine.check_health()
+        """Check engine health by verifying the Orchestrator process is alive."""
+        if self.errored:
+            raise EngineDeadError("Orchestrator process is not alive")
 
     # ==================== Shutdown ====================
 
