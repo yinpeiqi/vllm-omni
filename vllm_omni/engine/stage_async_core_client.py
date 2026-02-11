@@ -333,7 +333,7 @@ class StageAsyncCoreClient(AsyncMPClient):
     ) -> None:
         """Add request - supports both EngineCoreRequest and task dict."""
         logger.info(
-            f"[StageAsyncCoreClient] Stage-{self.stage_id} adding request: {request}"
+            f"[StageAsyncCoreClient] Stage-{self.stage_id} adding request: {request.request_id if isinstance(request, EngineCoreRequest) else request.get('request_id', 'N/A')}"
         )
         await super().add_request_async(request)
 
@@ -376,9 +376,9 @@ class StageAsyncCoreClient(AsyncMPClient):
             for so, p in zip(source_outputs, prompt)
         }
 
-        logger.info(
-            f"[StageAsyncCoreClient] Stage-{self.stage_id} processing engine inputs: {source_outputs}"
-        )
+        # logger.info(
+        #     f"[StageAsyncCoreClient] Stage-{self.stage_id} processing engine inputs: {source_outputs}"
+        # )
         return [
             OmniTokensPrompt(
                 prompt_token_ids=so.outputs[0].token_ids,

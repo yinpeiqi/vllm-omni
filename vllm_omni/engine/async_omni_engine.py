@@ -2,16 +2,16 @@
 Async Omni Engine for vLLM-Omni V1 architecture.
 
 Manages multiple stages with StageAsyncCoreClient.
-The Orchestrator child process owns all stage clients and handles
-stage-to-stage transfers. AsyncOmniEngine in the main process is a
-thin proxy that communicates with the Orchestrator via mp.Queues.
+The Orchestrator runs as a coroutine in a background thread (with its own
+asyncio event loop).  AsyncOmniEngine in the caller's thread is a thin
+proxy that communicates with the Orchestrator via asyncio.Queues.
 """
 
 from __future__ import annotations
 
 import asyncio
-import multiprocessing as mp
-import queue
+import concurrent.futures
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,12 +38,12 @@ logger = init_logger(__name__)
 
 
 # ============================================================
-# Orchestrator internals (run inside the child process)
+# Orchestrator internals (run inside the background thread)
 # ============================================================
 
 @dataclass
 class _OrchestratorRequestState:
-    """Per-request bookkeeping inside the Orchestrator process."""
+    """Per-request bookkeeping inside the Orchestrator."""
 
     request_id: str
     prompt: Any = None
@@ -52,7 +52,7 @@ class _OrchestratorRequestState:
 
 
 class _Orchestrator:
-    """Runs inside the Orchestrator child process.
+    """Runs inside a background thread's asyncio event loop.
 
     Owns all StageAsyncCoreClient instances, input/output processors,
     and handles stage-to-stage transfer logic.
@@ -62,8 +62,8 @@ class _Orchestrator:
         self,
         model: str,
         stage_configs: Any,
-        request_queue: mp.Queue,
-        output_queue: mp.Queue,
+        request_queue: asyncio.Queue,
+        output_queue: asyncio.Queue,
         stage_init_timeout: int = 300,
         log_requests: bool = True,
     ) -> None:
@@ -87,9 +87,11 @@ class _Orchestrator:
         # Per-request state
         self.request_states: dict[str, _OrchestratorRequestState] = {}
 
+        # Shutdown coordination
+        self._shutdown_event = asyncio.Event()
+
         self._initialize_stages()
         self._initialize_connectors()
-
 
     def _initialize_stages(self) -> None:
         """Initialize all stage clients and their processors."""
@@ -159,10 +161,9 @@ class _Orchestrator:
             self.omni_transfer_config = None
             self.connectors = {}
 
-
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
-        # Collect metadata to send back to the main process
+        # Collect metadata to send back to the main thread
         default_sampling_params_list = [
             sc.default_sampling_params for sc in self.stage_clients
         ]
@@ -174,7 +175,7 @@ class _Orchestrator:
                 "stage_type": sc.stage_type,
             })
 
-        self.output_queue.put({
+        await self.output_queue.put({
             "type": "ready",
             "num_stages": self.num_stages,
             "default_sampling_params_list": default_sampling_params_list,
@@ -188,10 +189,9 @@ class _Orchestrator:
         )
 
     async def _request_handler(self) -> None:
-        """Read messages from the main process via request_queue."""
-        loop = asyncio.get_event_loop()
+        """Read messages from the main thread via request_queue."""
         while True:
-            msg = await loop.run_in_executor(None, self.request_queue.get)
+            msg = await self.request_queue.get()
             msg_type = msg.get("type")
 
             if msg_type == "add_request":
@@ -200,17 +200,19 @@ class _Orchestrator:
                 await self._handle_abort(msg)
             elif msg_type == "shutdown":
                 logger.info("[Orchestrator] Received shutdown signal")
+                self._shutdown_event.set()
                 self._shutdown_stages()
                 break
             else:
                 logger.warning(f"[Orchestrator] Unknown message type: {msg_type}")
 
-
     async def _output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
-        while True:
+        while not self._shutdown_event.is_set():
             idle = True
             for stage_id in range(self.num_stages):
+                if self._shutdown_event.is_set():
+                    return
                 try:
                     request_outputs = await asyncio.wait_for(
                         self._get_stage_output(stage_id), timeout=0.001
@@ -218,6 +220,8 @@ class _Orchestrator:
                 except asyncio.TimeoutError:
                     continue
                 except Exception:
+                    if self._shutdown_event.is_set():
+                        return
                     logger.exception(
                         "[Orchestrator] _get_stage_output failed for stage-%s",
                         stage_id,
@@ -243,13 +247,13 @@ class _Orchestrator:
                     finished = getattr(output, "finished", False)
                     stage_client = self.stage_clients[stage_id]
 
-                    # 1) If this stage produces final output → send to main
+                    # 1) If this stage produces final output -> send to main
                     if stage_client.final_output:
                         is_fully_done = (
                             finished
                             and stage_id == req_state.final_stage_id
                         )
-                        self.output_queue.put({
+                        await self.output_queue.put({
                             "type": "output",
                             "request_id": req_id,
                             "stage_id": stage_id,
@@ -258,14 +262,13 @@ class _Orchestrator:
                             "finished": is_fully_done,
                         })
 
-
-                    # 2) If stage finished → forward to next stage
+                    # 2) If stage finished -> forward to next stage
                     if finished and stage_id < req_state.final_stage_id:
                         await self._forward_to_next_stage(
                             req_id, stage_id, output, req_state
                         )
 
-                    # 3) If all stages done → cleanup
+                    # 3) If all stages done -> cleanup
                     if finished and stage_id == req_state.final_stage_id:
                         self.request_states.pop(req_id, None)
 
@@ -274,7 +277,6 @@ class _Orchestrator:
             else:
                 await asyncio.sleep(0)
 
-
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -282,8 +284,7 @@ class _Orchestrator:
         output: Any,
         req_state: _OrchestratorRequestState,
     ) -> None:
-        """Execute stage transfer: same logic as the old
-        _process_sequential_results in AsyncOmniV1."""
+        """Execute stage transfer: forward output to the next stage."""
         if not isinstance(output, list):
             engine_outputs = [output]
         else:
@@ -300,7 +301,7 @@ class _Orchestrator:
             next_stage_id,
         )
 
-        # Process inputs for next stage (custom_process_input_func)
+        # Process inputs for next stage
         next_inputs = self.stage_clients[next_stage_id].process_engine_inputs(
             stage_list=self.stage_clients,
             prompt=req_state.prompt,
@@ -320,7 +321,6 @@ class _Orchestrator:
                 next_input,
                 req_state.sampling_params_list[next_stage_id],
             )
-
 
     async def _get_stage_output(self, stage_id: int) -> list[Any]:
         """Pull and process outputs from a single stage."""
@@ -373,7 +373,6 @@ class _Orchestrator:
                         "global_request_id"
                     ] = [str(request_id)]
 
-
         if isinstance(prompt, dict):
             _inject_global_id(prompt)
         elif isinstance(prompt, list):
@@ -404,11 +403,8 @@ class _Orchestrator:
                 params=params,
                 arrival_time=arrival_time,
             )
-            if isinstance(processed, tuple) and len(processed) == 2:
-                prompt_text, request = processed
-            else:
-                request = processed
-                prompt_text = prompt
+            request = processed
+            prompt_text = prompt
         else:
             request = prompt
 
@@ -432,9 +428,8 @@ class _Orchestrator:
                 stage_id,
             )
 
-
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
-        """Handle an add_request message from the main process."""
+        """Handle an add_request message from the main thread."""
         stage_id = msg["stage_id"]
         request_id = msg["request_id"]
         prompt = msg["prompt"]
@@ -453,7 +448,7 @@ class _Orchestrator:
         await self._add_request_to_stage(stage_id, request_id, prompt, params)
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
-        """Handle an abort message from the main process."""
+        """Handle an abort message from the main thread."""
         request_ids = msg["request_ids"]
         for stage_id in range(self.num_stages):
             await self.stage_clients[stage_id].abort_requests_async(request_ids)
@@ -474,20 +469,27 @@ class _Orchestrator:
                 )
 
 
-
-
-def _run_orchestrator_process(
+def _run_orchestrator_in_thread(
     model: str,
     stage_configs: Any,
-    request_queue: mp.Queue,
-    output_queue: mp.Queue,
+    request_queue: asyncio.Queue,
+    output_queue: asyncio.Queue,
     stage_init_timeout: int,
     log_requests: bool,
+    loop_ready: threading.Event,
+    loop_holder: list,
 ) -> None:
-    """Top-level entry point for the Orchestrator child process.
+    """Top-level entry point for the Orchestrator background thread.
 
     Creates a fresh asyncio event loop and runs the _Orchestrator.
+    Exposes the loop via *loop_holder* so the main thread can schedule
+    work on it (e.g. queue.put via call_soon_threadsafe).
     """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop_holder.append(loop)
+    loop_ready.set()
+
     try:
         orchestrator = _Orchestrator(
             model=model,
@@ -497,29 +499,33 @@ def _run_orchestrator_process(
             stage_init_timeout=stage_init_timeout,
             log_requests=log_requests,
         )
-        asyncio.run(orchestrator.run())
+        loop.run_until_complete(orchestrator.run())
     except Exception:
-        logger.exception("[Orchestrator] Process crashed")
-        # Signal the main process so it doesn't hang waiting for ready
+        logger.exception("[Orchestrator] Thread crashed")
+        # Signal the main thread so it doesn't hang waiting for ready
         try:
-            output_queue.put({"type": "error", "error": "Orchestrator process crashed"})
+            loop.run_until_complete(
+                output_queue.put({"type": "error", "error": "Orchestrator thread crashed"})
+            )
         except Exception:
             pass
         raise
+    finally:
+        loop.close()
 
 
 # ============================================================
-# AsyncOmniEngine — thin proxy in the main process
+# AsyncOmniEngine — thin proxy in the caller's thread
 # ============================================================
-
 
 
 class AsyncOmniEngine:
-    """Thin proxy that launches an Orchestrator child process.
+    """Thin proxy that launches an Orchestrator in a background thread.
 
     All stage clients, input/output processors, and stage-to-stage transfer
-    logic live inside the Orchestrator process. This class communicates with
-    it via two mp.Queues (request_queue and output_queue).
+    logic live inside the Orchestrator coroutine (running in its own thread
+    with a dedicated asyncio event loop).  This class communicates with it
+    via asyncio.Queues.
 
     Args:
         model: Model name or path
@@ -572,22 +578,24 @@ class AsyncOmniEngine:
                 stage_configs_path, base_engine_args=base_engine_args
             )
 
-
         self.stage_configs = resolved_configs
         self.num_stages = len(self.stage_configs)
 
         logger.info(
-            f"[AsyncOmniEngine] Launching Orchestrator process with "
+            f"[AsyncOmniEngine] Launching Orchestrator thread with "
             f"{self.num_stages} stages"
         )
 
-        # Create IPC queues
-        self.request_queue: mp.Queue = mp.Queue()
-        self.output_queue: mp.Queue = mp.Queue()
+        # Create asyncio queues (will be used from the orchestrator's loop)
+        self.request_queue: asyncio.Queue = asyncio.Queue()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
 
-        # Launch orchestrator child process
-        self.orchestrator_proc = mp.Process(
-            target=_run_orchestrator_process,
+        # Launch orchestrator background thread
+        loop_ready = threading.Event()
+        self._orch_loop_holder: list[asyncio.AbstractEventLoop] = []
+
+        self.orchestrator_thread = threading.Thread(
+            target=_run_orchestrator_in_thread,
             args=(
                 model,
                 self.stage_configs,
@@ -595,16 +603,22 @@ class AsyncOmniEngine:
                 self.output_queue,
                 stage_init_timeout,
                 log_requests,
+                loop_ready,
+                self._orch_loop_holder,
             ),
             daemon=True,
+            name="orchestrator",
         )
-        self.orchestrator_proc.start()
+        self.orchestrator_thread.start()
 
-        # Wait for ready signal from orchestrator
+        # Wait for the orchestrator's event loop to be available
+        loop_ready.wait()
+        self._orch_loop: asyncio.AbstractEventLoop = self._orch_loop_holder[0]
+
+        # Wait for ready signal from orchestrator (blocking, runs in this thread)
         logger.info("[AsyncOmniEngine] Waiting for Orchestrator ready signal")
-        try:
-            ready_msg = self.output_queue.get(timeout=stage_init_timeout)
-        except queue.Empty:
+        ready_msg = self._blocking_get_output(timeout=stage_init_timeout)
+        if ready_msg is None:
             raise TimeoutError(
                 f"Orchestrator did not become ready within "
                 f"{stage_init_timeout}s"
@@ -629,6 +643,23 @@ class AsyncOmniEngine:
             f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages"
         )
 
+    # ---- helpers for cross-thread queue access ----
+
+    def _put_to_request_queue(self, msg: dict[str, Any]) -> None:
+        """Thread-safe put onto the orchestrator's request_queue."""
+        self._orch_loop.call_soon_threadsafe(
+            self.request_queue.put_nowait, msg
+        )
+
+    def _blocking_get_output(self, timeout: float) -> dict[str, Any] | None:
+        """Blocking get from the output_queue (used during init)."""
+        fut = asyncio.run_coroutine_threadsafe(
+            self.output_queue.get(), self._orch_loop
+        )
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            return None
 
     @staticmethod
     def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list:
@@ -643,7 +674,7 @@ class AsyncOmniEngine:
             }
         ]
 
-    # ==================== Public API (proxy to Orchestrator) ====================
+    # ==================== Public API ====================
 
     async def add_request(
         self,
@@ -661,7 +692,7 @@ class AsyncOmniEngine:
         prompt_text: str | None = None,
     ) -> None:
         """Send an add_request message to the Orchestrator."""
-        self.request_queue.put({
+        self._put_to_request_queue({
             "type": "add_request",
             "stage_id": stage_id,
             "request_id": request_id,
@@ -674,15 +705,23 @@ class AsyncOmniEngine:
     def try_get_output(self) -> dict[str, Any] | None:
         """Non-blocking read from the Orchestrator output_queue."""
         try:
-            return self.output_queue.get_nowait()
-        except queue.Empty:
+            fut = asyncio.run_coroutine_threadsafe(
+                asyncio.wait_for(self.output_queue.get(), timeout=0),
+                self._orch_loop,
+            )
+            return fut.result(timeout=0.05)
+        except Exception:
             return None
 
     def try_get_output_blocking(self, timeout: float = 0.05) -> dict[str, Any] | None:
         """Blocking read from the Orchestrator output_queue with timeout."""
         try:
-            return self.output_queue.get(timeout=timeout)
-        except queue.Empty:
+            fut = asyncio.run_coroutine_threadsafe(
+                asyncio.wait_for(self.output_queue.get(), timeout=timeout),
+                self._orch_loop,
+            )
+            return fut.result(timeout=timeout + 0.1)
+        except Exception:
             return None
 
     def get_stage_metadata(self, stage_id: int) -> dict[str, Any]:
@@ -691,25 +730,24 @@ class AsyncOmniEngine:
 
     async def abort(self, request_ids: list[str]) -> None:
         """Send abort message to the Orchestrator."""
-        self.request_queue.put({
+        self._put_to_request_queue({
             "type": "abort",
             "request_ids": request_ids,
         })
 
     def shutdown(self) -> None:
-        """Send shutdown message and wait for the Orchestrator to exit."""
+        """Send shutdown message and wait for the Orchestrator thread to exit."""
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
         try:
-            self.request_queue.put({"type": "shutdown"})
+            self._put_to_request_queue({"type": "shutdown"})
         except Exception:
             pass
-        if hasattr(self, "orchestrator_proc") and self.orchestrator_proc.is_alive():
-            self.orchestrator_proc.join(timeout=10)
-            if self.orchestrator_proc.is_alive():
+        if hasattr(self, "orchestrator_thread") and self.orchestrator_thread.is_alive():
+            self.orchestrator_thread.join(timeout=10)
+            if self.orchestrator_thread.is_alive():
                 logger.warning(
-                    "[AsyncOmniEngine] Orchestrator did not exit, terminating"
+                    "[AsyncOmniEngine] Orchestrator thread did not exit in time"
                 )
-                self.orchestrator_proc.terminate()
 
     def __del__(self) -> None:
         try:
