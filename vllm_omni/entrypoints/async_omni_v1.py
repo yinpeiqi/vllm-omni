@@ -245,6 +245,7 @@ class AsyncOmniV1(EngineClient):
                     req_start_ts,
                     wall_start_ts,
                 ):
+                    # logger.info(f"yield output: {output}")
                     yield output
 
             logger.debug(f"[AsyncOmniV1] Request {request_id} completed")
@@ -433,7 +434,7 @@ class AsyncOmniV1(EngineClient):
         """Start the output handler if not already running.
 
         The output handler reads results from the Orchestrator's output_queue
-        (via mp.Queue) and routes them to per-request asyncio.Queues.
+        (via asyncio.Queue) and routes them to per-request asyncio.Queues.
         """
         if self.output_handler is not None:
             return
@@ -621,10 +622,10 @@ class AsyncOmniV1(EngineClient):
 
     @property
     def errored(self) -> bool:
-        """Check if the Orchestrator process has died."""
+        """Check if the Orchestrator thread has died."""
         return (
-            hasattr(self.engine, "orchestrator_proc")
-            and not self.engine.orchestrator_proc.is_alive()
+            hasattr(self.engine, "orchestrator_thread")
+            and not self.engine.orchestrator_thread.is_alive()
         )
 
     @property
