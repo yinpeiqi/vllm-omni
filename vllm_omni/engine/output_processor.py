@@ -437,7 +437,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
         # for request_output in request_outputs:
         for request_output in request_outputs:
-            if "addition_information" in request_output.prompt:
+            if request_output.prompt is not None and "addition_information" in request_output.prompt:
                 adinfo = request_output.prompt["addition_information"]
                 for key, value in adinfo.items():
                     if isinstance(value, torch.Tensor):

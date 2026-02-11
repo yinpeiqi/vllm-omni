@@ -98,6 +98,7 @@ def _build_engine_core_request_from_tokens(
     else:
         pooling_params = params.clone()
 
+    # TODO: payload are parsed with the request by now. But will move to connector later.
     # Serialize prompt_embeds if present
     prompt_embeds_payload: PromptEmbedsPayload | None = None
     pe: torch.Tensor | None = prompt.get("prompt_embeds")
@@ -269,10 +270,11 @@ class _Orchestrator:
                     model_config=vllm_config.model_config
                 )
 
-            stage_input_processor = OmniInputProcessor(
-                vllm_config=vllm_config,
-                tokenizer=tokenizer,
-            )
+            if stage_id == 0:
+                self._stage0_input_processor = OmniInputProcessor(
+                    vllm_config=vllm_config,
+                    tokenizer=tokenizer,
+                )
 
             stage_output_processor = MultimodalOutputProcessor(
                 tokenizer=tokenizer,
@@ -281,8 +283,6 @@ class _Orchestrator:
             )
 
             self.stage_clients.append(stage_client)
-            if stage_id == 0:
-                self._stage0_input_processor = stage_input_processor
             self.output_processors.append(stage_output_processor)
             self.stage_tokenizers.append(tokenizer)
             self.stage_vllm_configs.append(vllm_config)
@@ -451,31 +451,25 @@ class _Orchestrator:
         output: Any,
         req_state: _OrchestratorRequestState,
     ) -> None:
-        """Execute stage transfer: forward output to the next stage."""
+        """Forward output from current stage to the next stage.
+
+        Handles the full pipeline: set outputs on current stage, compute
+        next-stage inputs, build lightweight requests, and submit them.
+        """
         if not isinstance(output, list):
             engine_outputs = [output]
         else:
             engine_outputs = output
 
-        # Set outputs on current stage client (for cross-stage data flow)
-        logger.info(
-            "[Orchestrator] req=%s set_engine_outputs on stage-%s, "
-            "num_outputs=%d",
-            req_id, stage_id, len(engine_outputs),
-        )
         self.stage_clients[stage_id].set_engine_outputs(engine_outputs)
 
         next_stage_id = stage_id + 1
-        logger.info(
-            "[Orchestrator] req=%s forwarding stage-%s -> stage-%s, "
-            "prompt type=%s",
-            req_id, stage_id, next_stage_id,
-            type(req_state.prompt).__name__,
-        )
+        next_client = self.stage_clients[next_stage_id]
+        params = req_state.sampling_params_list[next_stage_id]
 
         # Process inputs for next stage
         try:
-            next_inputs = self.stage_clients[next_stage_id].process_engine_inputs(
+            next_inputs = next_client.process_engine_inputs(
                 stage_list=self.stage_clients,
                 prompt=req_state.prompt,
             )
@@ -486,33 +480,39 @@ class _Orchestrator:
                 req_id, next_stage_id,
             )
             raise
-        logger.info(
-            "[Orchestrator] req=%s computed %d next_inputs for stage-%s, "
-            "types=%s",
-            req_id,
-            len(next_inputs),
-            next_stage_id,
-            [type(ni).__name__ for ni in next_inputs],
-        )
 
-        # Submit to next stage
-        for idx, next_input in enumerate(next_inputs):
-            logger.info(
-                "[Orchestrator] req=%s submitting input %d/%d to stage-%s, "
-                "keys=%s",
-                req_id, idx + 1, len(next_inputs), next_stage_id,
-                list(next_input.keys()) if isinstance(next_input, dict) else "N/A",
+        # Build and submit requests for each input
+        for next_input in next_inputs:
+            # Check connector
+            # TODO: connector is disabled in this implementation.
+            if self.connectors:
+                connector_key = (str(stage_id), str(next_stage_id))
+                connector = self.connectors.get(connector_key)
+                if connector:
+                    logger.debug(
+                        "[Orchestrator] Stage %s using connector from stage %s",
+                        next_stage_id, stage_id,
+                    )
+
+            request = _build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=next_input,
+                params=params,
+                model_config=self.stage_vllm_configs[next_stage_id].model_config,
             )
-            await self._add_request_to_stage(
-                next_stage_id,
-                req_id,
-                next_input,
-                req_state.sampling_params_list[next_stage_id],
+
+            OmniInputProcessor.assign_request_id(request)
+            request.request_id = req_id
+
+            self.output_processors[next_stage_id].add_request(
+                request=request,
+                prompt=None,
+                parent_req=None,
+                request_index=0,
+                queue=None,
             )
-        logger.info(
-            "[Orchestrator] req=%s forward stage-%s -> stage-%s DONE",
-            req_id, stage_id, next_stage_id,
-        )
+
+            await next_client.add_request_async(request)
 
     async def _get_stage_output(self, stage_id: int) -> list[Any]:
         """Pull and process outputs from a single stage."""
@@ -539,110 +539,6 @@ class _Orchestrator:
             pass
 
         return list(getattr(processed, "request_outputs", []) or [])
-
-    async def _add_request_to_stage(
-        self,
-        stage_id: int,
-        request_id: str,
-        prompt: Any,
-        params: Any,
-        arrival_time: float | None = None,
-    ) -> None:
-        """Process input and submit a request to a specific stage.
-
-        For stage 0, the prompt is already an OmniEngineCoreRequest
-        (pre-processed by AsyncOmniEngine.add_request) — just submit it.
-        For stage 1+, builds a lightweight request from OmniTokensPrompt.
-        """
-        logger.info(
-            "[Orchestrator] _add_request_to_stage: stage=%s req=%s "
-            "prompt_type=%s params_type=%s",
-            stage_id, request_id,
-            type(prompt).__name__, type(params).__name__,
-        )
-        stage_client = self.stage_clients[stage_id]
-
-        if isinstance(prompt, EngineCoreRequest):
-            # Already a fully-formed request (stage 0 pre-processed by
-            # AsyncOmniEngine.add_request — output processor already
-            # registered there).
-            request = prompt
-            logger.info(
-                "[Orchestrator] stage-%s req=%s using pre-processed "
-                "EngineCoreRequest (token_ids=%d)",
-                stage_id, request_id, len(request.prompt_token_ids),
-            )
-        else:
-            # Stage 1+ — inject global_request_id and build lightweight request
-            if isinstance(prompt, dict):
-                _inject_global_id(prompt, request_id)
-                logger.info(
-                    "[Orchestrator] stage-%s req=%s prompt dict keys=%s, "
-                    "token_ids=%d, has_embeds=%s",
-                    stage_id, request_id,
-                    list(prompt.keys()),
-                    len(prompt.get("prompt_token_ids", [])),
-                    prompt.get("prompt_embeds") is not None,
-                )
-            elif isinstance(prompt, list):
-                for item in prompt:
-                    _inject_global_id(item, request_id)
-
-            # Check connector
-            if stage_id > 0 and self.connectors:
-                connector_key = (str(stage_id - 1), str(stage_id))
-                connector = self.connectors.get(connector_key)
-                if connector:
-                    logger.debug(
-                        "[Orchestrator] Stage %s checking connector from stage %s",
-                        stage_id,
-                        stage_id - 1,
-                    )
-
-            request = _build_engine_core_request_from_tokens(
-                request_id=request_id,
-                prompt=prompt,
-                params=params,
-                arrival_time=arrival_time,
-                model_config=self.stage_vllm_configs[stage_id].model_config,
-            )
-            logger.info(
-                "[Orchestrator] stage-%s req=%s built EngineCoreRequest: "
-                "token_ids=%d, has_embeds=%s, has_additional_info=%s",
-                stage_id, request_id,
-                len(request.prompt_token_ids),
-                request.prompt_embeds is not None,
-                request.additional_information is not None,
-            )
-            # Keep original prompt for output processor (it reads
-            # prompt fields like "additional_information" later).
-            prompt_text = prompt
-
-            OmniInputProcessor.assign_request_id(request)
-            request.request_id = request_id
-
-            self.output_processors[stage_id].add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-            logger.info(
-                "[Orchestrator] stage-%s req=%s registered with "
-                "output_processor",
-                stage_id, request_id,
-            )
-
-        logger.info(
-            "[Orchestrator] stage-%s req=%s submitting to stage_client...",
-            stage_id, request_id,
-        )
-        await stage_client.add_request_async(request)
-        logger.info(
-            "[Orchestrator] stage-%s req=%s submitted OK",
-            stage_id, request_id,
-        )
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
@@ -672,7 +568,16 @@ class _Orchestrator:
             final_stage_id=final_stage_id,
         )
 
-        await self._add_request_to_stage(stage_id, request_id, prompt, params)
+        # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
+        # (pre-processed by AsyncOmniEngine.add_request, output processor
+        # already registered there) — submit directly.
+        request = prompt
+        logger.info(
+            "[Orchestrator] _handle_add_request: stage-%s req=%s "
+            "submitting pre-processed EngineCoreRequest (token_ids=%d)",
+            stage_id, request_id, len(request.prompt_token_ids),
+        )
+        await self.stage_clients[stage_id].add_request_async(request)
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
         """Handle an abort message from the main thread."""
