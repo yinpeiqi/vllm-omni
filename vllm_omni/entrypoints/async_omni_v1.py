@@ -93,6 +93,8 @@ class AsyncOmniV1(EngineClient):
         logger.info(f"[AsyncOmniV1] output_modalities: {output_modalities}")
         logger.info(f"[AsyncOmniV1] kwargs: {kwargs}")
         # Initialize AsyncOmniEngine (launches Orchestrator child process)
+        import time
+        st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
             stage_configs=stage_configs,
@@ -101,6 +103,8 @@ class AsyncOmniV1(EngineClient):
             log_requests=log_requests,
             **kwargs,
         )
+        et = time.time()
+        logger.info(f"[AsyncOmniV1] AsyncOmniEngine initialized in {et - st:.2f} seconds")
 
         # Pause/resume control
         self._pause_cond: asyncio.Condition = asyncio.Condition()
