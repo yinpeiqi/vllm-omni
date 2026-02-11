@@ -371,15 +371,20 @@ class _Orchestrator:
             return
 
     async def _output_handler_loop(self) -> None:
-        """Inner loop for _output_handler (separated for clean cancellation)."""
+        """Inner loop for _output_handler (separated for clean cancellation).
+
+        Control flow: poll raw → process through output processor → route.
+        """
         while not self._shutdown_event.is_set():
             idle = True
             for stage_id in range(self.num_stages):
                 if self._shutdown_event.is_set():
                     return
+
+                # 1) Poll raw outputs from the stage
                 try:
-                    request_outputs = await asyncio.wait_for(
-                        self._get_stage_output(stage_id), timeout=0.001
+                    raw_outputs = await asyncio.wait_for(
+                        self._poll_stage_raw(stage_id), timeout=0.001
                     )
                 except asyncio.TimeoutError:
                     continue
@@ -389,15 +394,22 @@ class _Orchestrator:
                     if self._shutdown_event.is_set():
                         return
                     logger.exception(
-                        "[Orchestrator] _get_stage_output failed for stage-%s",
+                        "[Orchestrator] _poll_stage_raw failed for stage-%s",
                         stage_id,
                     )
                     raise
 
-                if not request_outputs:
+                if raw_outputs is None:
                     continue
                 idle = False
 
+                # 2) Process raw outputs through the output processor
+                request_outputs = await self._process_stage_outputs(
+                    stage_id, raw_outputs
+                )
+
+                # 3) Route each processed output
+                stage_client = self.stage_clients[stage_id]
                 for output in request_outputs:
                     req_id = output.request_id
                     finished = getattr(output, "finished", False)
@@ -412,9 +424,7 @@ class _Orchestrator:
                         )
                         continue
 
-                    stage_client = self.stage_clients[stage_id]
-
-                    # 1) If this stage produces final output -> send to main
+                    # Send to main thread if this stage produces final output
                     if stage_client.final_output:
                         is_fully_done = (
                             finished
@@ -429,13 +439,13 @@ class _Orchestrator:
                             "finished": is_fully_done,
                         })
 
-                    # 2) If stage finished -> forward to next stage
+                    # Forward to next stage if this stage finished
                     if finished and stage_id < req_state.final_stage_id:
                         await self._forward_to_next_stage(
                             req_id, stage_id, output, req_state
                         )
 
-                    # 3) If all stages done -> cleanup
+                    # Cleanup when the final stage is done
                     if finished and stage_id == req_state.final_stage_id:
                         self.request_states.pop(req_id, None)
 
@@ -514,27 +524,40 @@ class _Orchestrator:
 
             await next_client.add_request_async(request)
 
-    async def _get_stage_output(self, stage_id: int) -> list[Any]:
-        """Pull and process outputs from a single stage."""
-        stage_client = self.stage_clients[stage_id]
-        stage_output_processor = self.output_processors[stage_id]
+    async def _poll_stage_raw(self, stage_id: int) -> Any | None:
+        """Pull raw EngineCoreOutputs from a stage client without processing.
 
-        outputs = await stage_client.get_output_async()
+        Returns the raw outputs object (with .outputs, .timestamp,
+        .scheduler_stats), or None when there is nothing to consume.
+        """
+        outputs = await self.stage_clients[stage_id].get_output_async()
+        if not outputs.outputs:
+            return None
+        return outputs
 
-        processed = stage_output_processor.process_outputs(
-            outputs.outputs,
-            getattr(outputs, "timestamp", None),
+    async def _process_stage_outputs(
+        self, stage_id: int, raw_outputs: Any
+    ) -> list[Any]:
+        """Run the output processor on raw outputs, returning RequestOutputs.
+
+        Also handles abort forwarding and scheduler stats updates.
+        """
+        processor = self.output_processors[stage_id]
+
+        processed = processor.process_outputs(
+            raw_outputs.outputs,
+            getattr(raw_outputs, "timestamp", None),
             None,
         )
 
         if getattr(processed, "reqs_to_abort", None):
-            await stage_client.abort_requests_async(processed.reqs_to_abort)
+            await self.stage_clients[stage_id].abort_requests_async(
+                processed.reqs_to_abort
+            )
 
         try:
-            if hasattr(outputs, "scheduler_stats"):
-                stage_output_processor.update_scheduler_stats(
-                    outputs.scheduler_stats
-                )
+            if hasattr(raw_outputs, "scheduler_stats"):
+                processor.update_scheduler_stats(raw_outputs.scheduler_stats)
         except Exception:
             pass
 
