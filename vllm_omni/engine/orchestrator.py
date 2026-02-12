@@ -41,6 +41,11 @@ from vllm_omni.engine.stage_init import (
     release_device_locks,
     setup_stage_devices,
 )
+from vllm_omni.entrypoints.log_utils import (
+    StageRequestMetrics,
+    StageStats,
+    count_tokens_from_outputs,
+)
 from vllm_omni.entrypoints.utils import resolve_model_config_path
 
 logger = init_logger(__name__)
@@ -86,7 +91,7 @@ def build_engine_core_request_from_tokens(
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt.
 
-    Lightweight alternative to the full InputProcessor pipeline — skips
+    Lightweight alternative to the full InputProcessor pipeline - skips
     tokenization, multimodal preprocessing, LoRA validation, and platform
     validation.  Intended for stage 1+ where the upstream stage has already
     produced token IDs and optional embeddings.
@@ -176,6 +181,9 @@ class OrchestratorRequestState:
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = 0
 
+    # Metrics: timestamp when request was submitted to each stage
+    stage_submit_ts: dict[int, float] = field(default_factory=dict)
+
 
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop.
@@ -212,6 +220,11 @@ class Orchestrator:
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
+
+        # Per-stage metrics accumulators (mirrors V0's _batch_seq / _agg_*)
+        self._batch_seq: list[int] = [0] * self.num_stages
+        self._agg_total_tokens: list[int] = [0] * self.num_stages
+        self._agg_total_gen_time_ms: list[float] = [0.0] * self.num_stages
 
         # Shutdown coordination
         self._shutdown_event = asyncio.Event()
@@ -434,6 +447,17 @@ class Orchestrator:
                         )
                         continue
 
+                    # Build metrics when request finishes at this stage
+                    stage_metrics = None
+                    if finished:
+                        stage_metrics = self._build_stage_metrics(
+                            stage_id, req_id, [output], req_state,
+                        )
+
+                    # Grab the submit timestamp so the main thread can
+                    # set stage_first_ts accurately.
+                    submit_ts = req_state.stage_submit_ts.get(stage_id)
+
                     # Send to main thread if this stage produces final output
                     if stage_client.final_output:
                         is_fully_done = (
@@ -445,8 +469,19 @@ class Orchestrator:
                             "request_id": req_id,
                             "stage_id": stage_id,
                             "engine_outputs": [output],
-                            "metrics": None,
+                            "metrics": stage_metrics,
                             "finished": is_fully_done,
+                            "stage_submit_ts": submit_ts,
+                        })
+                    elif stage_metrics is not None:
+                        # Non-final stage: send metrics-only message so
+                        # OrchestratorMetrics can aggregate per-stage stats.
+                        await self.output_queue.put({
+                            "type": "stage_metrics",
+                            "request_id": req_id,
+                            "stage_id": stage_id,
+                            "metrics": stage_metrics,
+                            "stage_submit_ts": submit_ts,
                         })
 
                     # Forward to next stage if this stage finished
@@ -463,6 +498,54 @@ class Orchestrator:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+
+    def _build_stage_metrics(
+        self,
+        stage_id: int,
+        req_id: str,
+        request_outputs: list[RequestOutput],
+        req_state: OrchestratorRequestState,
+    ) -> StageRequestMetrics:
+        """Build StageRequestMetrics for a finished request at a stage.
+
+        Reuses the same StageRequestMetrics dataclass as V0 so that
+        OrchestratorMetrics / on_stage_metrics / on_finalize_request
+        work identically.
+        """
+        now = _time.time()
+        submit_ts = req_state.stage_submit_ts.get(stage_id, now)
+        stage_gen_time_ms = (now - submit_ts) * 1000.0
+
+        num_tokens_out = count_tokens_from_outputs(request_outputs)
+        num_tokens_in = 0
+        if stage_id == 0:
+            for ro in request_outputs:
+                ptids = getattr(ro, "prompt_token_ids", None)
+                if ptids is not None:
+                    num_tokens_in += len(ptids)
+
+        # Monotonic batch counter per stage (mirrors V0's _batch_seq)
+        self._batch_seq[stage_id] += 1
+        batch_id = self._batch_seq[stage_id]
+
+        # Accumulate for running-average stage_stats
+        self._agg_total_tokens[stage_id] += num_tokens_out
+        self._agg_total_gen_time_ms[stage_id] += stage_gen_time_ms
+
+        return StageRequestMetrics(
+            num_tokens_in=num_tokens_in,
+            num_tokens_out=num_tokens_out,
+            stage_gen_time_ms=stage_gen_time_ms,
+            batch_id=batch_id,
+            batch_size=1,
+            rx_decode_time_ms=0.0,
+            rx_transfer_bytes=0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(
+                total_token=self._agg_total_tokens[stage_id],
+                total_gen_time=self._agg_total_gen_time_ms[stage_id],
+            ),
+        )
 
     async def _forward_to_next_stage(
         self,
@@ -534,6 +617,9 @@ class Orchestrator:
 
             await next_client.add_request_async(request)
 
+        # Record submit timestamp for the next stage
+        req_state.stage_submit_ts[next_stage_id] = _time.time()
+
     async def _poll_stage_raw(self, stage_id: int) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage client without processing.
 
@@ -589,18 +675,20 @@ class Orchestrator:
             final_stage_id, len(sampling_params_list),
         )
 
-        # Track request state — use original_prompt so downstream stages
+        # Track request state - use original_prompt so downstream stages
         # (e.g. thinker2talker) can access the raw dict with multi_modal_data.
-        self.request_states[request_id] = OrchestratorRequestState(
+        req_state = OrchestratorRequestState(
             request_id=request_id,
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
         )
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        self.request_states[request_id] = req_state
 
         # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
         # (pre-processed by AsyncOmniEngine.add_request, output processor
-        # already registered there) — submit directly.
+        # already registered there) - submit directly.
         request = prompt
         logger.info(
             "[Orchestrator] _handle_add_request: stage-%s req=%s "
