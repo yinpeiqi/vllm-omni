@@ -17,9 +17,11 @@ from typing import Any
 import torch
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
+from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
@@ -420,7 +422,7 @@ class Orchestrator:
                 stage_client = self.stage_clients[stage_id]
                 for output in request_outputs:
                     req_id = output.request_id
-                    finished = getattr(output, "finished", False)
+                    finished = output.finished
                     req_state = self.request_states.get(req_id)
                     if req_state is None:
                         logger.warning(
@@ -532,11 +534,11 @@ class Orchestrator:
 
             await next_client.add_request_async(request)
 
-    async def _poll_stage_raw(self, stage_id: int) -> Any | None:
+    async def _poll_stage_raw(self, stage_id: int) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage client without processing.
 
-        Returns the raw outputs object (with .outputs, .timestamp,
-        .scheduler_stats), or None when there is nothing to consume.
+        Returns the raw outputs object, or None when there is nothing
+        to consume.
         """
         outputs = await self.stage_clients[stage_id].get_output_async()
         if not outputs.outputs:
@@ -544,8 +546,8 @@ class Orchestrator:
         return outputs
 
     async def _process_stage_outputs(
-        self, stage_id: int, raw_outputs: Any
-    ) -> list[Any]:
+        self, stage_id: int, raw_outputs: EngineCoreOutputs
+    ) -> list[RequestOutput]:
         """Run the output processor on raw outputs, returning RequestOutputs.
 
         Also handles abort forwarding and scheduler stats updates.
@@ -554,22 +556,19 @@ class Orchestrator:
 
         processed = processor.process_outputs(
             raw_outputs.outputs,
-            getattr(raw_outputs, "timestamp", None),
+            raw_outputs.timestamp,
             None,
         )
 
-        if getattr(processed, "reqs_to_abort", None):
+        if processed.reqs_to_abort:
             await self.stage_clients[stage_id].abort_requests_async(
                 processed.reqs_to_abort
             )
 
-        try:
-            if hasattr(raw_outputs, "scheduler_stats"):
-                processor.update_scheduler_stats(raw_outputs.scheduler_stats)
-        except Exception:
-            pass
-
-        return list(getattr(processed, "request_outputs", []) or [])
+        if raw_outputs.scheduler_stats is not None:
+            processor.update_scheduler_stats(raw_outputs.scheduler_stats)
+        
+        return processed.request_outputs
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
