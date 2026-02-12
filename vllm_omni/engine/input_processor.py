@@ -127,15 +127,6 @@ class OmniInputProcessor(InputProcessor):
             ValueError: If data_parallel_rank is out of range or prompt_embeds
                 has incorrect shape
         """
-        logger.info(f"Processing inputs: request_id: {request_id},\n" +
-            f"prompt: {prompt.keys()},\n" +
-            f"params: {params},\n" +
-            f"arrival_time: {arrival_time},\n" +
-            f"lora_request: {lora_request},\n" +
-            f"tokenization_kwargs: {tokenization_kwargs},\n" +
-            f"trace_headers: {trace_headers},\n" +
-            f"priority: {priority},\n" +
-            f"data_parallel_rank: {data_parallel_rank}")
         self._validate_lora(lora_request)
         self._validate_params(params)
 
@@ -275,19 +266,6 @@ class OmniInputProcessor(InputProcessor):
                 entries[key] = entry
             additional_information_payload = AdditionalInformationPayload(entries=entries)
 
-        logger.info(f"OmniEngineCoreRequest: request_id: {request_id}, \n" + \
-            f"prompt_token_ids: {len(prompt_token_ids)}, \n" + \
-            f"mm_features: {mm_features}, \n" + \
-            f"sampling_params: {sampling_params}, \n" + \
-            f"pooling_params: {pooling_params}, \n" + \
-            f"eos_token_id: {eos_token_id}, \n" + \
-            f"arrival_time: {arrival_time}, \n" + \
-            f"lora_request: {lora_request}, \n" + \
-            f"priority: {priority}, \n" + \
-            f"data_parallel_rank: {data_parallel_rank}, \n" + \
-            f"trace_headers: {trace_headers}, \n" + \
-            f"prompt_embeds: {prompt_embeds_payload.shape if prompt_embeds_payload else None}")
-            # f"additional_information: {additional_information_payload}")
         return OmniEngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,

@@ -34,7 +34,7 @@ from vllm_omni.engine import (
     OmniEngineCoreRequest,
     PromptEmbedsPayload,
 )
-from vllm_omni.engine.input_processor import OmniInputProcessor
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.stage_async_core_client import StageAsyncCoreClient
 from vllm_omni.engine.stage_init import (
@@ -65,6 +65,36 @@ def _inject_global_id(target: Any, request_id: str) -> None:
             target["additional_information"][
                 "global_request_id"
             ] = [str(request_id)]
+
+
+def _dtype_to_name(dtype: torch.dtype) -> str:
+    """Convert torch dtype to string representation.
+
+    Args:
+        dtype: PyTorch dtype to convert
+
+    Returns:
+        String representation of the dtype (e.g., "float32", "int64")
+    """
+    mapping = {
+        torch.float32: "float32",
+        torch.float: "float32",
+        torch.float16: "float16",
+        torch.half: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float64: "float64",
+        torch.double: "float64",
+        torch.int64: "int64",
+        torch.long: "int64",
+        torch.int32: "int32",
+        torch.int: "int32",
+        torch.int16: "int16",
+        torch.short: "int16",
+        torch.int8: "int8",
+        torch.uint8: "uint8",
+        torch.bool: "bool",
+    }
+    return mapping.get(dtype, str(dtype).replace("torch.", ""))
 
 
 def _build_engine_core_request_from_tokens(
@@ -107,7 +137,7 @@ def _build_engine_core_request_from_tokens(
         prompt_embeds_payload = PromptEmbedsPayload(
             data=pe_cpu.numpy().tobytes(),
             shape=list(pe_cpu.shape),
-            dtype=OmniInputProcessor._dtype_to_name(pe_cpu.dtype),
+            dtype=_dtype_to_name(pe_cpu.dtype),
         )
 
     # Serialize additional_information if present
@@ -121,7 +151,7 @@ def _build_engine_core_request_from_tokens(
                 entries[key] = AdditionalInformationEntry(
                     tensor_data=v_cpu.numpy().tobytes(),
                     tensor_shape=list(v_cpu.shape),
-                    tensor_dtype=OmniInputProcessor._dtype_to_name(v_cpu.dtype),
+                    tensor_dtype=_dtype_to_name(v_cpu.dtype),
                 )
             elif isinstance(value, list):
                 entries[key] = AdditionalInformationEntry(list_data=value)
@@ -198,7 +228,7 @@ class _Orchestrator:
         self.stage_tokenizers: list[TokenizerLike] = []
         self.stage_vllm_configs: list[VllmConfig] = []
         self.connectors: dict[tuple[str, str], Any] = {}
-        self._stage0_input_processor: OmniInputProcessor | None = None
+        self.input_processor: InputProcessor | None = None
 
         # Per-request state
         self.request_states: dict[str, _OrchestratorRequestState] = {}
@@ -271,7 +301,7 @@ class _Orchestrator:
                 )
 
             if stage_id == 0:
-                self._stage0_input_processor = OmniInputProcessor(
+                self.input_processor = InputProcessor(
                     vllm_config=vllm_config,
                     tokenizer=tokenizer,
                 )
@@ -308,7 +338,7 @@ class _Orchestrator:
             "num_stages": self.num_stages,
             "default_sampling_params_list": default_sampling_params_list,
             "stage_metadata": stage_metadata,
-            "input_processor": self._stage0_input_processor,
+            "input_processor": self.input_processor,
             "output_processors": self.output_processors,
         })
 
@@ -511,8 +541,8 @@ class _Orchestrator:
                 model_config=self.stage_vllm_configs[next_stage_id].model_config,
             )
 
-            OmniInputProcessor.assign_request_id(request)
-            request.request_id = req_id
+            # TODO: Here we directly use the req id to assign.
+            request.external_req_id = request.request_id
 
             self.output_processors[next_stage_id].add_request(
                 request=request,
@@ -793,7 +823,7 @@ class AsyncOmniEngine:
             "default_sampling_params_list"
         ]
         self.stage_metadata = ready_msg["stage_metadata"]
-        self.input_processor: OmniInputProcessor = ready_msg["input_processor"]
+        self.input_processor: InputProcessor = ready_msg["input_processor"]
         self.output_processors: list[MultimodalOutputProcessor] = ready_msg[
             "output_processors"
         ]
@@ -876,8 +906,8 @@ class AsyncOmniEngine:
                 params=params,
                 arrival_time=arrival_time,
             )
-            OmniInputProcessor.assign_request_id(request)
-            request.request_id = request_id
+            # TODO: Here we directly use the req id to assign.
+            request.external_req_id = request.request_id
 
             # Register with stage 0's output processor
             self.output_processors[0].add_request(
