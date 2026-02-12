@@ -372,15 +372,23 @@ class AsyncOmniV1(EngineClient):
         if isinstance(engine_outputs, list) and len(engine_outputs) > 0:
             engine_outputs = engine_outputs[0]
 
-        finished = getattr(engine_outputs, "finished", False)
+        finished = engine_outputs.finished
 
-        # Mark last output time
-        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+        # Mark stage timestamps: use the Orchestrator's submit timestamp
+        # for stage_first_ts so it reflects when the request was actually
+        # submitted, not when the result arrived in the main thread.
+        submit_ts = result.get("stage_submit_ts")
+        now = time.time()
+        if metrics.stage_first_ts[stage_id] is None:
+            metrics.stage_first_ts[stage_id] = (
+                submit_ts if submit_ts is not None else now
+            )
+        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
         # Process metrics
+        _m = result.get("metrics")
         try:
-            _m = result.get("metrics")
-            if _m is not None and finished:
+            if finished:
                 if hasattr(_m, "__dict__"):
                     _m = asdict(_m)
                 metrics.on_stage_metrics(stage_id, req_id, _m)
@@ -460,6 +468,34 @@ class AsyncOmniV1(EngineClient):
                         continue
 
                     msg_type = msg.get("type")
+                    if msg_type == "stage_metrics":
+                        # Non-final stage metrics: aggregate directly
+                        # without routing through the per-request queue.
+                        req_id = msg.get("request_id")
+                        req_state = request_states.get(req_id)
+                        if req_state is not None and req_state.metrics is not None:
+                            _m = msg.get("metrics")
+                            if _m is not None:
+                                stage_id = msg.get("stage_id", 0)
+                                if hasattr(_m, "__dict__"):
+                                    _m = asdict(_m)
+                                req_state.metrics.on_stage_metrics(
+                                    stage_id, req_id, _m,
+                                )
+                                # Use the Orchestrator's submit timestamp
+                                # for stage_first_ts (when the request was
+                                # actually submitted to this stage).
+                                submit_ts = msg.get("stage_submit_ts")
+                                now = time.time()
+                                if req_state.metrics.stage_first_ts[stage_id] is None:
+                                    req_state.metrics.stage_first_ts[stage_id] = (
+                                        submit_ts if submit_ts is not None else now
+                                    )
+                                req_state.metrics.stage_last_ts[stage_id] = max(
+                                    req_state.metrics.stage_last_ts[stage_id] or 0.0,
+                                    now,
+                                )
+                        continue
                     if msg_type != "output":
                         logger.warning(
                             "[AsyncOmniV1] output_handler got unexpected msg type: %s",

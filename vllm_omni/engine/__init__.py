@@ -79,16 +79,3 @@ class OmniEngineCoreOutput(EngineCoreOutput):
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
     outputs: list[OmniEngineCoreOutput] = []
-
-# V1 architecture exports (StageMPClient inherits from vLLM's EngineCoreClient)
-from vllm_omni.engine.stage_core_client import StageMPClient
-
-__all__ = [
-    "OmniEngineCoreRequest",
-    "OmniEngineCoreOutput",
-    "OmniEngineCoreOutputs",
-    "PromptEmbedsPayload",
-    "AdditionalInformationEntry",
-    "AdditionalInformationPayload",
-    "StageMPClient",
-]
