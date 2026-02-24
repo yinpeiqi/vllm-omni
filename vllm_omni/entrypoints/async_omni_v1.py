@@ -7,6 +7,7 @@ StageAsyncCoreClient instances) instead of OmniStage with worker processes.
 
 from __future__ import annotations
 
+import os
 import asyncio
 import time
 import types
@@ -35,6 +36,19 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 logger = init_logger(__name__)
+
+
+def _dummy_snapshot_download(model_id):
+    return model_id
+
+def omni_snapshot_download(model_id) -> str:
+    # TODO: this is just a workaround for quickly use modelscope, we should support
+    # modelscope in weight loading feature instead of using `snapshot_download`
+    if os.environ.get("VLLM_USE_MODELSCOPE", False):
+        from modelscope.hub.snapshot_download import snapshot_download
+        return snapshot_download(model_id)
+    else:
+        return _dummy_snapshot_download(model_id)
 
 
 class AsyncOmniV1(EngineClient):
@@ -77,6 +91,7 @@ class AsyncOmniV1(EngineClient):
         output_modalities: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        model = omni_snapshot_download(model)
         self.model = model
         self.log_requests = log_requests
         self.enable_stats = enable_stats
