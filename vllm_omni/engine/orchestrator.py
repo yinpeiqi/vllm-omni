@@ -33,6 +33,7 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.stage_async_core_client import StageAsyncCoreClient
+from vllm_omni.engine.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.engine.stage_init import (
     acquire_device_locks,
     build_vllm_config,
@@ -213,7 +214,6 @@ class Orchestrator:
         # Will be populated by _initialize_stages
         self.stage_clients: list[StageAsyncCoreClient] = []
         self.output_processors: list[MultimodalOutputProcessor] = []
-        self.stage_tokenizers: list[TokenizerLike] = []
         self.stage_vllm_configs: list[VllmConfig] = []
         self.connectors: dict[tuple[str, str], Any] = {}
         self.input_processor: InputProcessor | None = None
@@ -269,6 +269,19 @@ class Orchestrator:
 
             metadata = extract_stage_metadata(stage_cfg)
             setup_stage_devices(stage_id, metadata.runtime_cfg)
+
+            if metadata.stage_type == "diffusion":
+                from vllm_omni.diffusion.data import OmniDiffusionConfig
+                od_config = OmniDiffusionConfig.from_kwargs(
+                    model=self.model, **_to_dict(stage_cfg.engine_args)
+                )
+                stage_client = StageDiffusionClient(self.model, od_config, metadata)
+                self.stage_clients.append(stage_client)
+                self.output_processors.append(None)
+                self.stage_vllm_configs.append(None)
+                logger.info(f"[Orchestrator] Stage {stage_id} initialized (diffusion)")
+                continue
+
             vllm_config, executor_class = build_vllm_config(stage_cfg, self.model)
 
             engine_args_dict = _to_dict(stage_cfg.engine_args)
@@ -307,7 +320,6 @@ class Orchestrator:
 
             self.stage_clients.append(stage_client)
             self.output_processors.append(stage_output_processor)
-            self.stage_tokenizers.append(tokenizer)
             self.stage_vllm_configs.append(vllm_config)
 
             logger.info(f"[Orchestrator] Stage {stage_id} initialized")
@@ -404,6 +416,23 @@ class Orchestrator:
                 if self._shutdown_event.is_set():
                     return
 
+                # 1) Diffusion stage: poll non-blocking queue
+                # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput, 
+                # which is different from EngineCoreOutputs (LLM stages). We may want to unify 
+                # the output format in the future to simplify the processing logic in Orchestrator.
+                stage_client = self.stage_clients[stage_id]
+                if stage_client.stage_type == "diffusion":
+                    output = stage_client.get_diffusion_output_async()
+                    if output is not None:
+                        idle = False
+                        req_state = self.request_states.get(output.request_id)
+                        if req_state is not None:
+                            stage_metrics = self._build_stage_metrics(
+                                stage_id, output.request_id, [output], req_state
+                            )
+                            await self._route_output(stage_id, output, req_state, stage_metrics)
+                    continue
+
                 # 1) Poll raw outputs from the stage
                 try:
                     raw_outputs = await asyncio.wait_for(
@@ -432,72 +461,65 @@ class Orchestrator:
                 )
 
                 # 3) Route each processed output
-                stage_client = self.stage_clients[stage_id]
                 for output in request_outputs:
-                    req_id = output.request_id
-                    finished = output.finished
-                    req_state = self.request_states.get(req_id)
+                    req_state = self.request_states.get(output.request_id)
                     if req_state is None:
                         logger.warning(
                             "[Orchestrator] Dropping output for unknown req %s "
                             "at stage-%s (known reqs: %s)",
-                            req_id,
-                            stage_id,
+                            output.request_id, stage_id,
                             list(self.request_states.keys()),
                         )
                         continue
-
-                    # Build metrics when request finishes at this stage
                     stage_metrics = None
-                    if finished:
+                    if output.finished:
                         stage_metrics = self._build_stage_metrics(
-                            stage_id, req_id, [output], req_state,
+                            stage_id, output.request_id, [output], req_state,
                         )
-
-                    # Grab the submit timestamp so the main thread can
-                    # set stage_first_ts accurately.
-                    submit_ts = req_state.stage_submit_ts.get(stage_id)
-
-                    # Send to main thread if this stage produces final output
-                    if stage_client.final_output:
-                        is_fully_done = (
-                            finished
-                            and stage_id == req_state.final_stage_id
-                        )
-                        await self.output_queue.put({
-                            "type": "output",
-                            "request_id": req_id,
-                            "stage_id": stage_id,
-                            "engine_outputs": [output],
-                            "metrics": stage_metrics,
-                            "finished": is_fully_done,
-                            "stage_submit_ts": submit_ts,
-                        })
-                    elif stage_metrics is not None:
-                        # Non-final stage: send metrics-only message so
-                        # OrchestratorMetrics can aggregate per-stage stats.
-                        await self.output_queue.put({
-                            "type": "stage_metrics",
-                            "request_id": req_id,
-                            "stage_id": stage_id,
-                            "metrics": stage_metrics,
-                            "stage_submit_ts": submit_ts,
-                        })
-
-                    # Forward to next stage if this stage finished
-                    if finished and stage_id < req_state.final_stage_id:
-                        await self._forward_to_next_stage(
-                            req_id, stage_id, output, req_state
-                        )
-
-                    # Cleanup when the final stage is done
-                    if finished and stage_id == req_state.final_stage_id:
-                        self.request_states.pop(req_id, None)
+                    await self._route_output(stage_id, output, req_state, stage_metrics)
 
             if idle:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+
+    async def _route_output(
+        self,
+        stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        stage_metrics: Any,
+    ) -> None:
+        """Route a processed output: send to main thread and/or forward to next stage."""
+        req_id = output.request_id
+        finished = output.finished
+        submit_ts = req_state.stage_submit_ts.get(stage_id)
+        stage_client = self.stage_clients[stage_id]
+
+        if stage_client.final_output:
+            await self.output_queue.put({
+                "type": "output",
+                "request_id": req_id,
+                "stage_id": stage_id,
+                "engine_outputs": [output],
+                "metrics": stage_metrics,
+                "finished": finished and stage_id == req_state.final_stage_id,
+                "stage_submit_ts": submit_ts,
+            })
+        elif stage_metrics is not None:
+            await self.output_queue.put({
+                "type": "stage_metrics",
+                "request_id": req_id,
+                "stage_id": stage_id,
+                "metrics": stage_metrics,
+                "stage_submit_ts": submit_ts,
+            })
+
+        if finished and stage_id < req_state.final_stage_id:
+            await self._forward_to_next_stage(req_id, stage_id, output, req_state)
+
+        if finished and stage_id == req_state.final_stage_id:
+            self.request_states.pop(req_id, None)
 
     def _build_stage_metrics(
         self,
@@ -559,16 +581,30 @@ class Orchestrator:
         Handles the full pipeline: set outputs on current stage, compute
         next-stage inputs, build lightweight requests, and submit them.
         """
+        next_stage_id = stage_id + 1
+        next_client = self.stage_clients[next_stage_id]
+        params = req_state.sampling_params_list[next_stage_id]
+
+        # TODO: current we don't have model in this situation, verify next.
+        # Diffusion next stage: use custom_process_input_func or raw prompt
+        if next_client.stage_type == "diffusion":
+            raise NotImplementedError("Diffusion stage cannot be followed by another stage yet")
+            # if next_client.custom_process_input_func is not None:
+            #     diffusion_prompt = next_client.custom_process_input_func(
+            #         output, req_state.prompt, self.stage_clients
+            #     )
+            # else:
+            #     diffusion_prompt = req_state.prompt
+            # await next_client.add_request_async(req_id, diffusion_prompt, params)
+            # req_state.stage_submit_ts[next_stage_id] = _time.time()
+            # return
+
         if not isinstance(output, list):
             engine_outputs = [output]
         else:
             engine_outputs = output
 
         self.stage_clients[stage_id].set_engine_outputs(engine_outputs)
-
-        next_stage_id = stage_id + 1
-        next_client = self.stage_clients[next_stage_id]
-        params = req_state.sampling_params_list[next_stage_id]
 
         # Process inputs for next stage
         try:
@@ -690,12 +726,21 @@ class Orchestrator:
         # (pre-processed by AsyncOmniEngine.add_request, output processor
         # already registered there) - submit directly.
         request = prompt
-        logger.info(
-            "[Orchestrator] _handle_add_request: stage-%s req=%s "
-            "submitting pre-processed EngineCoreRequest (token_ids=%d)",
-            stage_id, request_id, len(request.prompt_token_ids),
-        )
-        await self.stage_clients[stage_id].add_request_async(request)
+        stage_client = self.stage_clients[stage_id]
+        if stage_client.stage_type == "diffusion":
+            logger.info(
+                "[Orchestrator] _handle_add_request: stage-%s req=%s "
+                "submitting diffusion request",
+                stage_id, request_id,
+            )
+            await stage_client.add_request_async(request_id, prompt, params)
+        else:
+            logger.info(
+                "[Orchestrator] _handle_add_request: stage-%s req=%s "
+                "submitting pre-processed EngineCoreRequest (token_ids=%d)",
+                stage_id, request_id, len(request.prompt_token_ids),
+            )
+            await stage_client.add_request_async(request)
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
         """Handle an abort message from the main thread."""

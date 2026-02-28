@@ -233,7 +233,8 @@ class AsyncOmniEngine:
         # dict, e.g. for multi_modal_data).
         original_prompt = prompt
 
-        if stage_id == 0 and not isinstance(prompt, EngineCoreRequest):
+        stage_type = self.stage_metadata[stage_id].get("stage_type")
+        if stage_id == 0 and stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt
             if isinstance(prompt, dict):
                 _inject_global_id(prompt, request_id)

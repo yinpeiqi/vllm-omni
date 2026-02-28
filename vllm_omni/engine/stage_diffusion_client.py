@@ -1,0 +1,98 @@
+"""Stage Diffusion Client for vLLM-Omni V1 architecture.
+
+Wraps AsyncOmniDiffusion to expose the same interface the Orchestrator
+expects from any stage client.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING, Any
+
+from vllm.logger import init_logger
+
+from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
+from vllm_omni.engine.stage_init import StageMetadata
+from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+
+logger = init_logger(__name__)
+
+
+class StageDiffusionClient:
+    """Wraps AsyncOmniDiffusion for use inside the Orchestrator.
+
+    Exposes the same attributes and async methods the Orchestrator
+    uses on StageAsyncCoreClient, but routes execution through
+    DiffusionEngine instead of vLLM EngineCore.
+    """
+
+    stage_type: str = "diffusion"
+
+    def __init__(
+        self,
+        model: str,
+        od_config: "OmniDiffusionConfig",
+        metadata: StageMetadata,
+    ) -> None:
+        self.stage_id = metadata.stage_id
+        self.final_output = metadata.final_output
+        self.final_output_type = metadata.final_output_type
+        self.default_sampling_params = metadata.default_sampling_params
+        self.custom_process_input_func = metadata.custom_process_input_func
+
+        self._engine = AsyncOmniDiffusion(model=model, od_config=od_config)
+        self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        self._tasks: dict[str, asyncio.Task] = {}
+
+        logger.info("[StageDiffusionClient] Stage-%s initialized", self.stage_id)
+
+    async def add_request_async(
+        self,
+        request_id: str,
+        prompt: "OmniPromptType",
+        sampling_params: "OmniDiffusionSamplingParams",
+    ) -> None:
+        task = asyncio.create_task(
+            self._run(request_id, prompt, sampling_params),
+            name=f"diffusion-{request_id}",
+        )
+        self._tasks[request_id] = task
+
+    async def _run(
+        self,
+        request_id: str,
+        prompt: "OmniPromptType",
+        sampling_params: "OmniDiffusionSamplingParams",
+    ) -> None:
+        try:
+            result = await self._engine.generate(prompt, sampling_params, request_id)
+            await self._output_queue.put(result)
+        except Exception as e:
+            logger.exception(
+                "[StageDiffusionClient] Stage-%s req=%s failed: %s",
+                self.stage_id, request_id, e,
+            )
+        finally:
+            self._tasks.pop(request_id, None)
+
+    def get_diffusion_output_async(self) -> OmniRequestOutput | None:
+        try:
+            return self._output_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        for rid in request_ids:
+            task = self._tasks.pop(rid, None)
+            if task:
+                task.cancel()
+
+    def shutdown(self) -> None:
+        for task in self._tasks.values():
+            task.cancel()
+        self._tasks.clear()
+        self._engine.close()

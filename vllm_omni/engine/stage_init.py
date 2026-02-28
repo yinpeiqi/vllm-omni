@@ -53,29 +53,14 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     stage_type: Literal["llm", "diffusion"] = getattr(
         stage_config, "stage_type", "llm"
     )
-    if stage_type == "diffusion":
-        raise NotImplementedError(
-            "Diffusion not supported with EngineCore. Use V0 architecture."
-        )
-
     engine_args = stage_config.engine_args
-    model_stage = getattr(engine_args, "model_stage", None)
-    engine_output_type = getattr(engine_args, "engine_output_type", None)
-    is_comprehension = getattr(stage_config, "is_comprehension", False)
-
     runtime_cfg = getattr(stage_config, "runtime", {})
-    requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
-
-    engine_input_source: list[int] = getattr(
-        stage_config, "engine_input_source", []
-    )
+    engine_input_source: list[int] = getattr(stage_config, "engine_input_source", [])
     final_output: bool = getattr(stage_config, "final_output", False)
     final_output_type: str | None = getattr(stage_config, "final_output_type", None)
 
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
-    SPClass = (
-        SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    )
+    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
     default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
 
     custom_process_input_func: Callable | None = None
@@ -84,6 +69,27 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         custom_process_input_func = getattr(
             importlib.import_module(mod_path), fn_name
         )
+
+    if stage_type == "diffusion":
+        return StageMetadata(
+            stage_id=stage_id,
+            stage_type="diffusion",
+            engine_output_type=None,
+            is_comprehension=False,
+            requires_multimodal_data=False,
+            engine_input_source=engine_input_source,
+            final_output=final_output,
+            final_output_type=final_output_type,
+            default_sampling_params=default_sampling_params,
+            custom_process_input_func=custom_process_input_func,
+            model_stage=None,
+            runtime_cfg=runtime_cfg,
+        )
+
+    model_stage = getattr(engine_args, "model_stage", None)
+    engine_output_type = getattr(engine_args, "engine_output_type", None)
+    is_comprehension = getattr(stage_config, "is_comprehension", False)
+    requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
 
     return StageMetadata(
         stage_id=stage_id,

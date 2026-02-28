@@ -402,13 +402,8 @@ class AsyncOmniV1(EngineClient):
 
         # Process metrics
         _m = result.get("metrics")
-        try:
-            if finished:
-                if hasattr(_m, "__dict__"):
-                    _m = asdict(_m)
-                metrics.on_stage_metrics(stage_id, req_id, _m)
-        except Exception as e:
-            logger.exception(f"[AsyncOmniV1] Failed to process metrics for stage {stage_id}, req {req_id}: {e}")
+        if finished and _m is not None:
+            metrics.on_stage_metrics(stage_id, req_id, asdict(_m))
 
         logger.debug(f"[AsyncOmniV1] Stage-{stage_id} completed request {req_id}")
 
