@@ -12,7 +12,6 @@ import os
 import time
 import types
 from collections.abc import AsyncGenerator, Iterable, Sequence
-from dataclasses import asdict
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -25,8 +24,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
+from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -136,6 +135,14 @@ class AsyncOmniV1(EngineClient):
         # Get default sampling params from the Orchestrator ready message
         self.default_sampling_params_list = self.engine.default_sampling_params_list
 
+        # Build output_modalities from stage metadata (mirrors V0's omni.py:
+        # self.output_modalities = [st.final_output_type for st in self.stage_list])
+        # This is used as default_modalities in get_final_stage_id_for_e2e.
+        if not self.output_modalities:
+            self.output_modalities = [
+                self.engine.get_stage_metadata(i).get("final_output_type") for i in range(self.engine.num_stages)
+            ]
+
         logger.info(f"[AsyncOmniV1] Initialized with {self.engine.num_stages} stages for model {model}")
 
     @property
@@ -220,6 +227,7 @@ class AsyncOmniV1(EngineClient):
                 self.num_stages,
                 self.enable_stats,
                 wall_start_ts,
+                final_stage_id_for_e2e,
             )
 
             # Create request state
@@ -239,12 +247,6 @@ class AsyncOmniV1(EngineClient):
             )
             metrics.stage_first_ts[0] = time.time()
             req_start_ts[request_id] = time.time()
-            logger.info("[AsyncOmniV1] submitted request %s to stage-0", request_id)
-
-            logger.info(
-                f"[AsyncOmniV1] Entering scheduling loop: stages={self.num_stages}, "
-                f"final_stage={final_stage_id_for_e2e}"
-            )
 
             # Process results based on mode
             if self.async_chunk:
@@ -270,7 +272,7 @@ class AsyncOmniV1(EngineClient):
 
             # Log summary
             try:
-                summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
+                summary = metrics.build_and_log_summary()
                 logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
             except Exception as e:
                 logger.exception(f"[AsyncOmniV1] Failed to build/log summary: {e}")
@@ -400,17 +402,13 @@ class AsyncOmniV1(EngineClient):
         # Process metrics
         _m = result.get("metrics")
         if finished and _m is not None:
-            metrics.on_stage_metrics(stage_id, req_id, asdict(_m))
-
-        logger.debug(f"[AsyncOmniV1] Stage-{stage_id} completed request {req_id}")
+            metrics.on_stage_metrics(stage_id, req_id, _m)
 
         # Determine if this is a final output stage (use cached metadata)
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_to_yield = None
 
         if stage_meta["final_output"]:
-            logger.debug(f"[AsyncOmniV1] Request {req_id} finalized at stage-{stage_id}")
-
             # Finalize request metrics
             try:
                 rid_key = str(req_id)
@@ -482,8 +480,6 @@ class AsyncOmniV1(EngineClient):
                             _m = msg.get("metrics")
                             if _m is not None:
                                 stage_id = msg.get("stage_id", 0)
-                                if hasattr(_m, "__dict__"):
-                                    _m = asdict(_m)
                                 req_state.metrics.on_stage_metrics(
                                     stage_id,
                                     req_id,

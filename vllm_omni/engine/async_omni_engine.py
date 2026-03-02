@@ -74,11 +74,6 @@ class AsyncOmniEngine:
         self.log_requests = log_requests
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
-        logger.info(f"[AsyncOmniEngine] stage_configs: {stage_configs}")
-        logger.info(f"[AsyncOmniEngine] stage_configs_path: {stage_configs_path}")
-        logger.info(f"[AsyncOmniEngine] stage_init_timeout: {stage_init_timeout}")
-        logger.info(f"[AsyncOmniEngine] log_requests: {log_requests}")
-        logger.info(f"[AsyncOmniEngine] kwargs: {kwargs}")
 
         # --- Resolve stage configs (same logic as before) ---
         tokenizer = kwargs.get("tokenizer", None)
@@ -129,7 +124,6 @@ class AsyncOmniEngine:
         self._orch_loop: asyncio.AbstractEventLoop = self._orch_loop_holder[0]
 
         # Wait for ready signal from orchestrator (blocking, runs in this thread)
-        logger.info("[AsyncOmniEngine] Waiting for Orchestrator ready signal")
         ready_msg = self._blocking_get_output(timeout=stage_init_timeout)
         if ready_msg is None:
             raise TimeoutError(f"Orchestrator did not become ready within {stage_init_timeout}s")
@@ -218,8 +212,13 @@ class AsyncOmniEngine:
                 params=params,
                 arrival_time=arrival_time,
             )
-            # TODO: Here we directly use the req id to assign.
-            request.external_req_id = request.request_id
+            # Restore external_req_id to the original user-facing request_id.
+            # InputProcessor.process_inputs() renames request_id to an internal
+            # UUID (saving the original in external_req_id), but then overwrites
+            # external_req_id with the new internal ID. We need external_req_id
+            # to match the key used in Orchestrator.request_states so that
+            # output routing (output.request_id lookup) can find the req_state.
+            request.external_req_id = request_id
 
             # Register with stage 0's output processor
             self.output_processors[0].add_request(

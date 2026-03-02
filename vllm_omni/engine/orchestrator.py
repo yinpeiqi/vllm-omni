@@ -42,12 +42,10 @@ from vllm_omni.engine.stage_init import (
     release_device_locks,
     setup_stage_devices,
 )
-from vllm_omni.entrypoints.log_utils import (
-    StageRequestMetrics,
-    StageStats,
-    count_tokens_from_outputs,
-)
 from vllm_omni.entrypoints.utils import resolve_model_config_path
+from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
+from vllm_omni.metrics.stats import StageStats
+from vllm_omni.metrics.utils import count_tokens_from_outputs
 
 logger = init_logger(__name__)
 
@@ -179,7 +177,7 @@ class OrchestratorRequestState:
     request_id: str
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
-    final_stage_id: int = 0
+    final_stage_id: int = -1
 
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
@@ -301,7 +299,6 @@ class Orchestrator:
             if stage_id == 0:
                 self.input_processor = InputProcessor(
                     vllm_config=vllm_config,
-                    tokenizer=tokenizer,
                 )
 
             stage_output_processor = MultimodalOutputProcessor(
@@ -347,14 +344,20 @@ class Orchestrator:
         output_task = asyncio.create_task(self._output_handler(), name="orchestrator-output-handler")
 
         try:
-            # _request_handler exits on shutdown; once it's done, cancel
-            # the output handler so we don't leave dangling wait_for tasks.
-            await request_task
+            # Run both tasks concurrently; if either fails the other is cancelled.
+            await asyncio.gather(request_task, output_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[Orchestrator] Fatal error in orchestrator tasks")
+            raise
         finally:
-            output_task.cancel()
+            for t in (request_task, output_task):
+                if not t.done():
+                    t.cancel()
             try:
-                await output_task
-            except asyncio.CancelledError:
+                await asyncio.gather(request_task, output_task, return_exceptions=True)
+            except Exception:
                 pass
 
             # Cancel any remaining tasks spawned by wait_for / gather so
@@ -553,7 +556,7 @@ class Orchestrator:
             rx_in_flight_time_ms=0.0,
             stage_stats=StageStats(
                 total_token=self._agg_total_tokens[stage_id],
-                total_gen_time=self._agg_total_gen_time_ms[stage_id],
+                total_gen_time_ms=self._agg_total_gen_time_ms[stage_id],
             ),
         )
 
@@ -716,20 +719,8 @@ class Orchestrator:
         request = prompt
         stage_client = self.stage_clients[stage_id]
         if stage_client.stage_type == "diffusion":
-            logger.info(
-                "[Orchestrator] _handle_add_request: stage-%s req=%s submitting diffusion request",
-                stage_id,
-                request_id,
-            )
             await stage_client.add_request_async(request_id, prompt, params)
         else:
-            logger.info(
-                "[Orchestrator] _handle_add_request: stage-%s req=%s "
-                "submitting pre-processed EngineCoreRequest (token_ids=%d)",
-                stage_id,
-                request_id,
-                len(request.prompt_token_ids),
-            )
             await stage_client.add_request_async(request)
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
