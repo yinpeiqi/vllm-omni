@@ -43,6 +43,7 @@ class StageDiffusionClient:
         self.final_output_type = metadata.final_output_type
         self.default_sampling_params = metadata.default_sampling_params
         self.custom_process_input_func = metadata.custom_process_input_func
+        self.engine_input_source = metadata.engine_input_source
 
         self._engine = AsyncOmniDiffusion(model=model, od_config=od_config)
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()

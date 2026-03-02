@@ -579,16 +579,21 @@ class Orchestrator:
         # TODO: current we don't have model in this situation, verify next.
         # Diffusion next stage: use custom_process_input_func or raw prompt
         if next_client.stage_type == "diffusion":
-            raise NotImplementedError("Diffusion stage cannot be followed by another stage yet")
-            # if next_client.custom_process_input_func is not None:
-            #     diffusion_prompt = next_client.custom_process_input_func(
-            #         output, req_state.prompt, self.stage_clients
-            #     )
-            # else:
-            #     diffusion_prompt = req_state.prompt
-            # await next_client.add_request_async(req_id, diffusion_prompt, params)
-            # req_state.stage_submit_ts[next_stage_id] = _time.time()
-            # return
+            self.stage_clients[stage_id].set_engine_outputs([output])
+            if next_client.custom_process_input_func is not None:
+                diffusion_prompt = next_client.custom_process_input_func(
+                    self.stage_clients,
+                    next_client.engine_input_source,
+                    req_state.prompt,
+                    False,
+                )
+                if isinstance(diffusion_prompt, list):
+                    diffusion_prompt = diffusion_prompt[0]
+            else:
+                diffusion_prompt = req_state.prompt
+            await next_client.add_request_async(req_id, diffusion_prompt, params)
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            return
 
         if not isinstance(output, list):
             engine_outputs = [output]
