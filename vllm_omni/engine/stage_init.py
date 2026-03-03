@@ -140,7 +140,11 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
         logger.warning("Device setup failed for stage %s: %s", stage_id, e)
 
 
-def build_vllm_config(stage_config: Any, model: str) -> tuple[Any, type]:
+def build_vllm_config(
+    stage_config: Any,
+    model: str,
+    stage_connector_spec: dict[str, Any] | None = None,
+) -> tuple[Any, type]:
     """Build engine_args_dict, resolve worker class, create VllmConfig and executor_class.
 
     Returns:
@@ -152,6 +156,9 @@ def build_vllm_config(stage_config: Any, model: str) -> tuple[Any, type]:
 
     engine_args_dict = _to_dict(engine_args)
     engine_args_dict["model"] = model
+    if engine_args_dict.get("async_chunk", False):
+        engine_args_dict["stage_id"] = stage_id
+        engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args_dict)

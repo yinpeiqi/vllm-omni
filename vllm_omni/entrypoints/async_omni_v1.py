@@ -123,6 +123,10 @@ class AsyncOmniV1(EngineClient):
         )
         et = time.time()
         logger.info(f"[AsyncOmniV1] AsyncOmniEngine initialized in {et - st:.2f} seconds")
+        # Keep compatibility with V0 behavior: async_chunk can be enabled
+        # from YAML stage config without passing the constructor flag.
+        self.async_chunk = bool(self.async_chunk or getattr(self.engine, "async_chunk", False))
+        logger.info(f"[AsyncOmniV1] effective async_chunk: {self.async_chunk}")
 
         # Pause/resume control
         self._pause_cond: asyncio.Condition = asyncio.Condition()
@@ -249,24 +253,17 @@ class AsyncOmniV1(EngineClient):
             req_start_ts[request_id] = time.time()
 
             # Process results based on mode
-            if self.async_chunk:
-                # Async chunk mode: not yet supported with Orchestrator process
-                raise NotImplementedError(
-                    "async_chunk mode is not yet supported with the Orchestrator "
-                    "process architecture. Use async_chunk=False."
-                )
-            else:
-                # Sequential mode: Orchestrator handles stage transitions.
-                # We just read results from the queue.
-                async for output in self._process_orchestrator_results(
-                    request_id,
-                    metrics,
-                    final_stage_id_for_e2e,
-                    req_start_ts,
-                    wall_start_ts,
-                ):
-                    # logger.info(f"yield output: {output}")
-                    yield output
+            # Both sequential and async_chunk modes read the same message stream
+            # from Orchestrator; stage-transfer behavior differs inside
+            # Orchestrator._route_output().
+            async for output in self._process_orchestrator_results(
+                request_id,
+                metrics,
+                final_stage_id_for_e2e,
+                req_start_ts,
+                wall_start_ts,
+            ):
+                yield output
 
             logger.debug(f"[AsyncOmniV1] Request {request_id} completed")
 

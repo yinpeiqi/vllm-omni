@@ -9,6 +9,7 @@ and handles stage-to-stage transfer logic.
 from __future__ import annotations
 
 import asyncio
+import copy
 import threading
 import time as _time
 from dataclasses import dataclass, field
@@ -24,7 +25,11 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
+from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
+from vllm_omni.distributed.omni_connectors import (
+    get_stage_connector_config,
+    initialize_orchestrator_connectors,
+)
 from vllm_omni.engine import (
     AdditionalInformationEntry,
     AdditionalInformationPayload,
@@ -207,6 +212,8 @@ class Orchestrator:
         self.log_requests = log_requests
 
         self.num_stages = len(stage_configs)
+        stage0_args = getattr(stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
+        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
 
         # Will be populated by _initialize_stages
         self.stage_clients: list[StageAsyncCoreClient] = []
@@ -264,6 +271,12 @@ class Orchestrator:
 
             metadata = extract_stage_metadata(stage_cfg)
             setup_stage_devices(stage_id, metadata.runtime_cfg)
+            stage_connector_spec: dict[str, Any] = {}
+            if self.async_chunk:
+                stage_connectors_cfg = get_stage_connector_config(self.omni_transfer_config, stage_id)
+                for cfg in stage_connectors_cfg.values():
+                    stage_connector_spec = dict(cfg.get("spec", {}))
+                    break
 
             if metadata.stage_type == "diffusion":
                 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -276,7 +289,11 @@ class Orchestrator:
                 logger.info(f"[Orchestrator] Stage {stage_id} initialized (diffusion)")
                 continue
 
-            vllm_config, executor_class = build_vllm_config(stage_cfg, self.model)
+            vllm_config, executor_class = build_vllm_config(
+                stage_cfg,
+                self.model,
+                stage_connector_spec=stage_connector_spec,
+            )
 
             engine_args_dict = _to_dict(stage_cfg.engine_args)
             engine_args_dict["model"] = self.model
@@ -506,7 +523,7 @@ class Orchestrator:
                 }
             )
 
-        if finished and stage_id < req_state.final_stage_id:
+        if finished and stage_id < req_state.final_stage_id and not self.async_chunk:
             await self._forward_to_next_stage(req_id, stage_id, output, req_state)
 
         if finished and stage_id == req_state.final_stage_id:
@@ -727,6 +744,73 @@ class Orchestrator:
             await stage_client.add_request_async(request_id, prompt, params)
         else:
             await stage_client.add_request_async(request)
+
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
+
+    async def _prewarm_async_chunk_stages(
+        self,
+        request_id: str,
+        stage0_request: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Pre-submit downstream stages for async-chunk mode.
+
+        In async-chunk mode, stages exchange data through connectors/chunk adapters,
+        so downstream stages should be armed once at request start instead of waiting
+        for stage-finished forwarding.
+        """
+        if req_state.final_stage_id <= 0:
+            return
+
+        prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
+        if prompt_token_ids is None:
+            logger.warning(
+                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage0 prompt_token_ids missing",
+                request_id,
+            )
+            return
+
+        # Match V0 behavior: pre-arm stage-1+ with placeholder prompt IDs.
+        try:
+            next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+        except Exception:
+            next_prompt_len = max(1, len(prompt_token_ids))
+        original_prompt = req_state.prompt
+        if isinstance(original_prompt, dict):
+            base_input = copy.deepcopy(original_prompt)
+        else:
+            base_input = {}
+        base_input["prompt_token_ids"] = [0] * next_prompt_len
+        base_input["multi_modal_data"] = None
+        base_input["mm_processor_kwargs"] = None
+
+        for next_stage_id in range(1, req_state.final_stage_id + 1):
+            next_client = self.stage_clients[next_stage_id]
+            params = req_state.sampling_params_list[next_stage_id]
+
+            if next_client.stage_type == "diffusion":
+                await next_client.add_request_async(request_id, req_state.prompt, params)
+                req_state.stage_submit_ts[next_stage_id] = _time.time()
+                continue
+
+            request = build_engine_core_request_from_tokens(
+                request_id=request_id,
+                prompt=base_input,
+                params=params,
+                model_config=self.stage_vllm_configs[next_stage_id].model_config,
+            )
+            request.external_req_id = request.request_id
+
+            self.output_processors[next_stage_id].add_request(
+                request=request,
+                prompt=None,
+                parent_req=None,
+                request_index=0,
+                queue=None,
+            )
+            await next_client.add_request_async(request)
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
         """Handle an abort message from the main thread."""
