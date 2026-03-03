@@ -91,6 +91,8 @@ class AsyncOmniEngine:
 
         self.stage_configs = resolved_configs
         self.num_stages = len(self.stage_configs)
+        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
+        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
