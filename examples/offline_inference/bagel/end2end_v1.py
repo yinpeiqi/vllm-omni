@@ -43,7 +43,9 @@ async def main():
 
     prompts = [{"prompt": f"<|im_start|>{p}<|im_end|>", "modalities": ["image"]} for p in raw_prompts]
 
-    omni = AsyncOmni(model=args.model, stage_init_timeout=args.stage_init_timeout)
+    omni = AsyncOmni(model=args.model, 
+                     stage_init_timeout=args.stage_init_timeout,
+                     log_stats=True)
 
     llm_params = SamplingParams(max_tokens=1)
     diffusion_params = OmniDiffusionSamplingParams(
