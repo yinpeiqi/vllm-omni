@@ -133,7 +133,7 @@ class AsyncOmniV1(EngineClient):
 
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
-        self.output_handler: asyncio.Task | None = None
+        self.final_output_task: asyncio.Task | None = None
 
         # Get default sampling params from the Orchestrator ready message
         self.default_sampling_params_list = self.engine.default_sampling_params_list
@@ -199,8 +199,8 @@ class AsyncOmniV1(EngineClient):
         logger.debug(f"[AsyncOmniV1] generate() called for request {request_id}")
 
         try:
-            # Start output handler on the first call to generate()
-            self._run_output_handler()
+            # Start final output dispatcher on the first call to generate()
+            self._final_output_handler()
 
             # Use default sampling params if not provided
             if sampling_params_list is None:
@@ -443,20 +443,20 @@ class AsyncOmniV1(EngineClient):
 
     # ==================== Output Handler ====================
 
-    def _run_output_handler(self) -> None:
-        """Start the output handler if not already running.
+    def _final_output_handler(self) -> None:
+        """Start the final output handler if not already running.
 
-        The output handler reads results from the Orchestrator's output_queue
-        (via asyncio.Queue) and routes them to per-request asyncio.Queues.
+        This handler reads messages from the Orchestrator output queue and
+        routes them to per-request asyncio.Queues.
         """
-        if self.output_handler is not None:
+        if self.final_output_task is not None:
             return
 
         request_states = self.request_states
         engine = self.engine
 
-        async def output_handler():
-            """Background coroutine that reads from the Orchestrator output queue."""
+        async def _final_output_loop():
+            """Background coroutine that dispatches final outputs to request queues."""
             loop = asyncio.get_event_loop()
             try:
                 while True:
@@ -497,7 +497,7 @@ class AsyncOmniV1(EngineClient):
                         continue
                     if msg_type != "output":
                         logger.warning(
-                            "[AsyncOmniV1] output_handler got unexpected msg type: %s",
+                            "[AsyncOmniV1] final_output_loop got unexpected msg type: %s",
                             msg_type,
                         )
                         continue
@@ -519,14 +519,14 @@ class AsyncOmniV1(EngineClient):
                     await req_state.queue.put(msg)
 
             except Exception as e:
-                logger.exception("[AsyncOmniV1] output_handler failed.")
+                logger.exception("[AsyncOmniV1] final_output_loop failed.")
                 for req_state in request_states.values():
                     error_msg = {"request_id": req_state.request_id, "error": str(e)}
                     await req_state.queue.put(error_msg)
-                self.output_handler = None
+                self.final_output_task = None
 
-        self.output_handler = asyncio.create_task(output_handler())
-        logger.debug("[AsyncOmniV1] Output handler started")
+        self.final_output_task = asyncio.create_task(_final_output_loop())
+        logger.debug("[AsyncOmniV1] Final output handler started")
 
     # ==================== Control Methods ====================
 
@@ -652,7 +652,7 @@ class AsyncOmniV1(EngineClient):
     @property
     def is_running(self) -> bool:
         """Check if the engine is running."""
-        return self.output_handler is None or not self.output_handler.done()
+        return self.final_output_task is None or not self.final_output_task.done()
 
     @property
     def is_stopped(self) -> bool:
@@ -718,8 +718,8 @@ class AsyncOmniV1(EngineClient):
         """Shutdown the engine."""
         logger.info("[AsyncOmniV1] Shutting down")
         self.engine.shutdown()
-        if self.output_handler is not None:
-            self.output_handler.cancel()
+        if self.final_output_task is not None:
+            self.final_output_task.cancel()
 
     def __del__(self):
         """Cleanup on deletion."""

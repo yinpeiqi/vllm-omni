@@ -212,7 +212,10 @@ class Orchestrator:
         logger.info("[Orchestrator] Starting event loop")
 
         request_task = asyncio.create_task(self._request_handler(), name="orchestrator-request-handler")
-        output_task = asyncio.create_task(self._output_handler(), name="orchestrator-output-handler")
+        output_task = asyncio.create_task(
+            self._orchestration_output_handler(),
+            name="orchestrator-stage-output-handler",
+        )
 
         try:
             # Run both tasks concurrently; if either fails the other is cancelled.
@@ -258,16 +261,16 @@ class Orchestrator:
             else:
                 logger.warning(f"[Orchestrator] Unknown message type: {msg_type}")
 
-    async def _output_handler(self) -> None:
+    async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
-            await self._output_handler_loop()
+            await self._orchestration_loop()
         except asyncio.CancelledError:
-            logger.debug("[Orchestrator] _output_handler cancelled")
+            logger.debug("[Orchestrator] _orchestration_output_handler cancelled")
             return
 
-    async def _output_handler_loop(self) -> None:
-        """Inner loop for _output_handler (separated for clean cancellation).
+    async def _orchestration_loop(self) -> None:
+        """Inner loop for _orchestration_output_handler (clean cancellation).
 
         Control flow: poll raw → process through output processor → route.
         """
