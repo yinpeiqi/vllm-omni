@@ -15,7 +15,6 @@ from vllm.v1.engine.core_client import AsyncMPClient
 from vllm_omni.engine.stage_init import StageMetadata
 
 if TYPE_CHECKING:
-    from vllm.inputs import TextPrompt
     from vllm.v1.engine import EngineCoreOutput
 
     from vllm_omni.inputs.data import OmniTokensPrompt
@@ -75,10 +74,9 @@ class StageEngineCoreClient(AsyncMPClient):
 
     # ==================== Overrides ====================
 
-    async def add_request_async(self, request: EngineCoreRequest | dict[str, Any]) -> None:
-        """Add request - supports both EngineCoreRequest and task dict."""
-        req_id = request.request_id if isinstance(request, EngineCoreRequest) else request.get("request_id", "N/A")
-        logger.info(f"[StageEngineCoreClient] Stage-{self.stage_id} adding request: {req_id}")
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        """Add request to the stage engine core."""
+        logger.info(f"[StageEngineCoreClient] Stage-{self.stage_id} adding request: {request.request_id}")
         await super().add_request_async(request)
 
     # ==================== Stage Methods ====================
@@ -90,8 +88,8 @@ class StageEngineCoreClient(AsyncMPClient):
     def process_engine_inputs(
         self,
         stage_list: list[Any],
-        prompt: OmniTokensPrompt | TextPrompt | None = None,
-    ) -> list[OmniTokensPrompt | TextPrompt]:
+        prompt: OmniTokensPrompt | list[OmniTokensPrompt] | None = None,
+    ) -> list[OmniTokensPrompt]:
         """Process inputs from upstream stages."""
         from vllm_omni.inputs.data import OmniTokensPrompt
 

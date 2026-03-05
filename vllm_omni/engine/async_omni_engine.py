@@ -15,7 +15,6 @@ from typing import Any
 from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
@@ -324,11 +323,6 @@ class AsyncOmniEngine:
         sampling_params_list: list[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
-        lora_request: LoRARequest | None = None,
-        tokenization_kwargs: dict[str, Any] | None = None,
-        trace_headers: dict[str, str] | None = None,
-        priority: int = 0,
-        prompt_text: str | None = None,
     ) -> None:
         """Process stage 0 input locally, then send to the Orchestrator.
 

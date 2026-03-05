@@ -363,7 +363,7 @@ class Orchestrator:
                     "type": "output",
                     "request_id": req_id,
                     "stage_id": stage_id,
-                    "engine_outputs": [output],
+                    "engine_outputs": output,
                     "metrics": stage_metrics,
                     "finished": finished and stage_id == req_state.final_stage_id,
                     "stage_submit_ts": submit_ts,
@@ -469,12 +469,7 @@ class Orchestrator:
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
-        if not isinstance(output, list):
-            engine_outputs = [output]
-        else:
-            engine_outputs = output
-
-        self.stage_clients[stage_id].set_engine_outputs(engine_outputs)
+        self.stage_clients[stage_id].set_engine_outputs([output])
 
         # Process inputs for next stage
         try:

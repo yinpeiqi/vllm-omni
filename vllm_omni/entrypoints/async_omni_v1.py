@@ -101,17 +101,13 @@ class AsyncOmniV1(EngineClient):
         self.output_modalities = output_modalities or []
 
         logger.info(f"[AsyncOmniV1] Initializing with model {model}")
-        logger.info(f"[AsyncOmniV1] stage_configs: {stage_configs}")
-        logger.info(f"[AsyncOmniV1] stage_configs_path: {stage_configs_path}")
-        logger.info(f"[AsyncOmniV1] stage_init_timeout: {stage_init_timeout}")
-        logger.info(f"[AsyncOmniV1] log_requests: {log_requests}")
-        logger.info(f"[AsyncOmniV1] enable_stats: {enable_stats}")
-        logger.info(f"[AsyncOmniV1] async_chunk: {async_chunk}")
-        logger.info(f"[AsyncOmniV1] output_modalities: {output_modalities}")
-        logger.info(f"[AsyncOmniV1] kwargs: {kwargs}")
+        logger.debug(
+            "[AsyncOmniV1] stage_configs=%s, stage_configs_path=%s, stage_init_timeout=%s, "
+            "log_requests=%s, enable_stats=%s, async_chunk=%s, output_modalities=%s, kwargs=%s",
+            stage_configs, stage_configs_path, stage_init_timeout,
+            log_requests, enable_stats, async_chunk, output_modalities, kwargs,
+        )
         # Initialize AsyncOmniEngine (launches Orchestrator child process)
-        import time
-
         st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
@@ -145,6 +141,11 @@ class AsyncOmniV1(EngineClient):
             self.output_modalities = [
                 self.engine.get_stage_metadata(i).get("final_output_type") for i in range(self.engine.num_stages)
             ]
+
+        # Cache stage metadata as SimpleNamespace list for get_final_stage_id_for_e2e
+        self._stage_meta_list = [
+            types.SimpleNamespace(**self.engine.get_stage_metadata(i)) for i in range(self.engine.num_stages)
+        ]
 
         logger.info(f"[AsyncOmniV1] Initialized with {self.engine.num_stages} stages for model {model}")
 
@@ -211,18 +212,13 @@ class AsyncOmniV1(EngineClient):
 
             # Track per-request metrics
             wall_start_ts = time.time()
-            req_start_ts: dict[int, float] = {}
+            req_start_ts: dict[str, float] = {}
 
             # Determine the final stage for E2E stats
-            # Use stage_metadata from the Orchestrator instead of direct stage_client access
-            # Wrap dicts in SimpleNamespace so getattr() works in get_final_stage_id_for_e2e
-            stage_meta_list = [
-                types.SimpleNamespace(**self.engine.get_stage_metadata(i)) for i in range(self.num_stages)
-            ]
             final_stage_id_for_e2e = get_final_stage_id_for_e2e(
                 output_modalities,
                 self.output_modalities,
-                stage_meta_list,
+                self._stage_meta_list,
             )
 
             # Create metrics tracker
@@ -295,8 +291,6 @@ class AsyncOmniV1(EngineClient):
         Omni pipeline currently exposes only generate() API at orchestrator level.
         """
         raise NotImplementedError("AsyncOmniV1.encode is not implemented.")
-        if False:  # pragma: no cover - keep as AsyncGenerator type
-            yield None  # type: ignore[misc]
 
     # ==================== Processing Methods ====================
 
@@ -305,7 +299,7 @@ class AsyncOmniV1(EngineClient):
         request_id: str,
         metrics: OrchestratorMetrics,
         final_stage_id_for_e2e: int,
-        req_start_ts: dict[int, float],
+        req_start_ts: dict[str, float],
         wall_start_ts: float,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Read results from the Orchestrator (via the request's asyncio.Queue)
@@ -334,7 +328,7 @@ class AsyncOmniV1(EngineClient):
                 raise RuntimeError(result)
 
             # Process the result (constructs OmniRequestOutput)
-            engine_outputs, finished, output_to_yield = self._process_single_result(
+            output_to_yield = self._process_single_result(
                 result,
                 stage_id,
                 metrics,
@@ -361,29 +355,19 @@ class AsyncOmniV1(EngineClient):
         result: dict[str, Any],
         stage_id: int,
         metrics: OrchestratorMetrics,
-        req_start_ts: dict[int, float],
+        req_start_ts: dict[str, float],
         wall_start_ts: float,
         final_stage_id_for_e2e: int,
-    ) -> tuple[Any, bool, OmniRequestOutput | None]:
+    ) -> OmniRequestOutput | None:
         """Process a single result from a stage.
 
         Returns:
-            engine_outputs: The decoded outputs.
-            finished: Whether the stage processing is finished.
             output_to_yield: An OmniRequestOutput to yield, or None.
         """
         req_id = result.get("request_id")
 
-        # Check for errors
-        if "error" in result:
-            logger.error(f"[AsyncOmniV1] Stage {stage_id} error on request {req_id}: {result['error']}")
-            raise RuntimeError(result)
-
         # Get engine outputs
         engine_outputs = result.get("engine_outputs")
-        if isinstance(engine_outputs, list) and len(engine_outputs) > 0:
-            engine_outputs = engine_outputs[0]
-
         finished = engine_outputs.finished
 
         # Mark stage timestamps: use the Orchestrator's submit timestamp
@@ -418,28 +402,15 @@ class AsyncOmniV1(EngineClient):
                 logger.exception(f"[AsyncOmniV1] Finalize request handling error: {e}")
 
             # Construct output to yield
-            images = []
-            if stage_meta["final_output_type"] == "image":
-                if isinstance(engine_outputs, OmniRequestOutput) and engine_outputs.images:
-                    images = engine_outputs.images
-                elif hasattr(engine_outputs, "images") and engine_outputs.images:
-                    images = engine_outputs.images
+            images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
+            output_to_yield = OmniRequestOutput(
+                stage_id=stage_id,
+                final_output_type=stage_meta["final_output_type"],
+                request_output=engine_outputs,
+                images=images,
+            )
 
-            if stage_meta["final_output_type"] == "image":
-                output_to_yield = OmniRequestOutput(
-                    stage_id=stage_id,
-                    final_output_type=stage_meta["final_output_type"],
-                    request_output=engine_outputs,
-                    images=images,
-                )
-            else:
-                output_to_yield = OmniRequestOutput(
-                    stage_id=stage_id,
-                    final_output_type=stage_meta["final_output_type"],
-                    request_output=engine_outputs,
-                )
-
-        return engine_outputs, finished, output_to_yield
+        return output_to_yield
 
     # ==================== Output Handler ====================
 
@@ -652,7 +623,7 @@ class AsyncOmniV1(EngineClient):
     @property
     def is_running(self) -> bool:
         """Check if the engine is running."""
-        return self.final_output_task is None or not self.final_output_task.done()
+        return self.final_output_task is not None and not self.final_output_task.done()
 
     @property
     def is_stopped(self) -> bool:
