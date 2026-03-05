@@ -185,3 +185,34 @@ V1:
   └──────────────────────┘  └──────────────────────┘  └──────────────────────┘
 ```
 
+
+Test scripts:
+```bash
+# enter offline inference folder.
+cd qwen2_5_omni
+
+# lagacy impl:
+VLLM_OMNI_USE_V1=0 VLLM_LOGGING_LEVEL=INFO python end2end_v1.py --output-wav output_audio \
+                  --query-type use_mixed_modalities
+# current impl:
+VLLM_OMNI_USE_V1=1 VLLM_LOGGING_LEVEL=INFO python end2end_v1.py --output-wav output_audio \
+                  --query-type use_mixed_modalities
+
+cd qwen3_omni
+# lagacy impl:
+VLLM_OMNI_USE_V1=0 python end2end_v1.py --output-wav output_audio --query-type text --async-chunk --enable-stats
+# current impl:
+VLLM_OMNI_USE_V1=1 python end2end_v1.py --output-wav output_audio --query-type text --async-chunk --enable-stats
+
+cd bagel
+# lagacy impl:
+VLLM_OMNI_USE_V1=0 python end2end_v1.py --prompts "A cute cat"
+# current impl:
+VLLM_OMNI_USE_V1=1 python end2end_v1.py --prompts "A cute cat"
+
+cd text_to_image
+# lagacy impl:
+VLLM_OMNI_USE_V1=0 python text_to_image_async.py --prompt "a cup of coffee on the table" --output output.png
+# current impl:
+VLLM_OMNI_USE_V1=1 python text_to_image_async.py --prompt "a cup of coffee on the table" --output output.png
+```
