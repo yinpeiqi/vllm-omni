@@ -98,23 +98,11 @@ class OmniV1Base:
         return self.engine.num_stages
 
     @property
-    def errored(self) -> bool:
-        return hasattr(self.engine, "orchestrator_thread") and not self.engine.orchestrator_thread.is_alive()
-
-    @property
     def is_running(self) -> bool:
-        return not self.errored
-
-    @property
-    def is_stopped(self) -> bool:
-        return self.errored
-
-    @property
-    def dead_error(self) -> BaseException:
-        return EngineDeadError()
+        return hasattr(self.engine, "orchestrator_thread") and self.engine.orchestrator_thread.is_alive()
 
     def check_health(self) -> None:
-        if self.errored:
+        if not (hasattr(self.engine, "orchestrator_thread") and self.engine.orchestrator_thread.is_alive()):
             raise EngineDeadError("Orchestrator process is not alive")
 
     def resolve_sampling_params_list(

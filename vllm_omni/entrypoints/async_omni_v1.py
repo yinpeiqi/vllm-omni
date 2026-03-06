@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_v1_base import (
@@ -433,6 +434,21 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
     def is_running(self) -> bool:
         """Check if the engine is running."""
         return self.final_output_task is not None and not self.final_output_task.done()
+
+    @property
+    def errored(self) -> bool:
+        """Whether orchestrator thread has stopped unexpectedly."""
+        return hasattr(self.engine, "orchestrator_thread") and not self.engine.orchestrator_thread.is_alive()
+
+    @property
+    def is_stopped(self) -> bool:
+        """EngineClient abstract property implementation."""
+        return self.errored
+
+    @property
+    def dead_error(self) -> BaseException:
+        """EngineClient abstract property implementation."""
+        return EngineDeadError()
 
     # ==================== EngineClient Interface ====================
 
