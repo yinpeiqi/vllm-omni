@@ -2,17 +2,19 @@
 Async Omni Engine for vLLM-Omni V1 architecture.
 
 AsyncOmniEngine in the caller's thread is a thin proxy that communicates
-with the Orchestrator (running in a background thread) via asyncio.Queues.
+with the Orchestrator (running in a background thread) via janus queues.
 """
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import queue
 import threading
 from collections.abc import Sequence
 from typing import Any
 
+import janus
 from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -45,8 +47,8 @@ class AsyncOmniEngine:
 
     All stage clients, input/output processors, and stage-to-stage transfer
     logic live inside the Orchestrator coroutine (running in its own thread
-    with a dedicated asyncio event loop).  This class communicates with it
-    via asyncio.Queues.
+    with a dedicated asyncio event loop). This class communicates with it
+    via janus queues (sync side for callers, async side for orchestrator).
 
     Args:
         model: Model name or path
@@ -181,6 +183,12 @@ class AsyncOmniEngine:
         self.stage_metadata = stage_metadata
         self.num_stages = len(stage_metadata)
 
+    def _initialize_janus_queues(self) -> None:
+        """Initialize janus queues inside orchestrator thread loop context."""
+        self.request_queue = janus.Queue()
+        self.output_queue = janus.Queue()
+        logger.debug("[AsyncOmniEngine] janus queues initialized in orchestrator thread loop")
+
     def _bootstrap_orchestrator(
         self,
         stage_init_timeout: int,
@@ -192,25 +200,31 @@ class AsyncOmniEngine:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        try:
+        async def _run_orchestrator() -> None:
+            self._initialize_janus_queues()
+
             self._initialize_stages(stage_init_timeout)
             orchestrator = Orchestrator(
-                request_queue=self.request_queue,
-                output_queue=self.output_queue,
+                request_async_queue=self.request_queue.async_q,
+                output_async_queue=self.output_queue.async_q,
                 async_chunk=self.async_chunk,
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
             )
             if not startup_future.done():
-                startup_future.set_result(loop)
-            loop.run_until_complete(orchestrator.run())
+                startup_future.set_result(asyncio.get_running_loop())
+            await orchestrator.run()
+
+        try:
+            loop.run_until_complete(_run_orchestrator())
         except Exception as e:
             if not startup_future.done():
                 startup_future.set_exception(RuntimeError(f"Orchestrator initialization failed: {e}"))
             logger.exception("[AsyncOmniEngine] Orchestrator thread crashed")
             try:
-                loop.run_until_complete(self.output_queue.put({"type": "error", "error": "Orchestrator thread crashed"}))
+                if self.output_queue is not None:
+                    self.output_queue.sync_q.put_nowait({"type": "error", "error": "Orchestrator thread crashed"})
             except Exception:
                 pass
             raise
@@ -259,12 +273,10 @@ class AsyncOmniEngine:
         self.input_processor: InputProcessor | None = None
         self.default_sampling_params_list: list[Any] = []
         self.stage_metadata: list[dict[str, Any]] = []
+        self.request_queue: janus.Queue[dict[str, Any]] | None = None
+        self.output_queue: janus.Queue[dict[str, Any]] | None = None
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
-
-        # Create asyncio queues (will be used from the orchestrator's loop)
-        self.request_queue: asyncio.Queue = asyncio.Queue()
-        self.output_queue: asyncio.Queue = asyncio.Queue()
 
         # Launch orchestrator background thread
         startup_future: concurrent.futures.Future = concurrent.futures.Future()
@@ -281,9 +293,8 @@ class AsyncOmniEngine:
         self.orchestrator_thread.start()
 
         # Wait for stage/runtime initialization result from orchestrator thread.
-        self._orch_loop: asyncio.AbstractEventLoop
         try:
-            self._orch_loop = startup_future.result(timeout=stage_init_timeout)
+            startup_future.result(timeout=stage_init_timeout)
         except concurrent.futures.TimeoutError as e:
             raise TimeoutError(f"Orchestrator did not become ready within {stage_init_timeout}s") from e
 
@@ -292,11 +303,75 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
-    # ---- helpers for cross-thread queue access ----
+    # ---- request helpers ----
 
-    def _put_to_request_queue(self, msg: dict[str, Any]) -> None:
-        """Thread-safe put onto the orchestrator's request_queue."""
-        self._orch_loop.call_soon_threadsafe(self.request_queue.put_nowait, msg)
+    def _build_add_request_message(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType,
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+        arrival_time: float | None = None,
+    ) -> dict[str, Any]:
+        """Build an add_request message after stage-0 preprocessing."""
+        effective_sampling_params_list = (
+            list(sampling_params_list)
+            if sampling_params_list is not None
+            else list(self.default_sampling_params_list)
+        )
+        if not effective_sampling_params_list:
+            raise ValueError(
+                "Missing sampling params for stage 0. "
+                f"Got {len(effective_sampling_params_list)} stage params."
+            )
+        params = effective_sampling_params_list[0]
+
+        # Keep the original prompt for downstream stages (they need the raw
+        # dict, e.g. for multi_modal_data).
+        original_prompt = prompt
+
+        stage_type = self.stage_metadata[0].get("stage_type")
+        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+            # Inject global_request_id into the raw prompt.
+            if isinstance(prompt, dict):
+                _inject_global_id(prompt, request_id)
+            elif isinstance(prompt, list):
+                for item in prompt:
+                    _inject_global_id(item, request_id)
+
+            # Full input processing (tokenization, multimodal, etc.)
+            request = self.input_processor.process_inputs(
+                request_id=request_id,
+                prompt=prompt,
+                params=params,
+                arrival_time=arrival_time,
+            )
+            # Restore external_req_id to the original user-facing request_id.
+            # InputProcessor.process_inputs() renames request_id to an internal
+            # UUID (saving the original in external_req_id), but then overwrites
+            # external_req_id with the new internal ID. We need external_req_id
+            # to match the key used in Orchestrator.request_states so that
+            # output routing (output.request_id lookup) can find the req_state.
+            request.external_req_id = request_id
+
+            # Register with stage 0's output processor.
+            self.output_processors[0].add_request(
+                request=request,
+                prompt=prompt,
+                parent_req=None,
+                request_index=0,
+                queue=None,
+            )
+            prompt = request
+
+        return {
+            "type": "add_request",
+            "request_id": request_id,
+            "prompt": prompt,
+            "original_prompt": original_prompt,
+            "sampling_params_list": effective_sampling_params_list,
+            "final_stage_id": final_stage_id,
+        }
 
     @staticmethod
     def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list:
@@ -328,88 +403,50 @@ class AsyncOmniEngine:
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
-        effective_sampling_params_list = (
-            list(sampling_params_list)
-            if sampling_params_list is not None
-            else list(self.default_sampling_params_list)
+        msg = self._build_add_request_message(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            arrival_time=arrival_time,
         )
-        if not effective_sampling_params_list:
-            raise ValueError(
-                "Missing sampling params for stage 0. "
-                f"Got {len(effective_sampling_params_list)} stage params."
-            )
-        params = effective_sampling_params_list[0]
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        self.request_queue.sync_q.put_nowait(msg)
 
-        # Keep the original prompt for downstream stages (they need the raw
-        # dict, e.g. for multi_modal_data).
-        original_prompt = prompt
-
-        stage_type = self.stage_metadata[0].get("stage_type")
-        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
-            # Inject global_request_id into the raw prompt
-            if isinstance(prompt, dict):
-                _inject_global_id(prompt, request_id)
-            elif isinstance(prompt, list):
-                for item in prompt:
-                    _inject_global_id(item, request_id)
-
-            # Full input processing (tokenization, multimodal, etc.)
-            request = self.input_processor.process_inputs(
-                request_id=request_id,
-                prompt=prompt,
-                params=params,
-                arrival_time=arrival_time,
-            )
-            # Restore external_req_id to the original user-facing request_id.
-            # InputProcessor.process_inputs() renames request_id to an internal
-            # UUID (saving the original in external_req_id), but then overwrites
-            # external_req_id with the new internal ID. We need external_req_id
-            # to match the key used in Orchestrator.request_states so that
-            # output routing (output.request_id lookup) can find the req_state.
-            request.external_req_id = request_id
-
-            # Register with stage 0's output processor
-            self.output_processors[0].add_request(
-                request=request,
-                prompt=prompt,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-
-            prompt = request
-
-        self._put_to_request_queue(
-            {
-                "type": "add_request",
-                "request_id": request_id,
-                "prompt": prompt,
-                "original_prompt": original_prompt,
-                "sampling_params_list": effective_sampling_params_list,
-                "final_stage_id": final_stage_id,
-            }
+    async def add_request_async(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType,
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+        arrival_time: float | None = None,
+    ) -> None:
+        """Async add_request API."""
+        self.add_request(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            arrival_time=arrival_time,
         )
 
-    def try_get_output(self) -> dict[str, Any] | None:
-        """Non-blocking read from the Orchestrator output_queue."""
+    def try_get_output(self, timeout: float = 0.001) -> dict[str, Any] | None:
+        """Read one output message from the Orchestrator output queue."""
+        if self.output_queue is None:
+            return None
         try:
-            fut = asyncio.run_coroutine_threadsafe(
-                asyncio.wait_for(self.output_queue.get(), timeout=0),
-                self._orch_loop,
-            )
-            return fut.result(timeout=0.05)
-        except Exception:
+            return self.output_queue.sync_q.get(timeout=timeout)
+        except queue.Empty:
             return None
 
-    def try_get_output_blocking(self, timeout: float = 0.05) -> dict[str, Any] | None:
-        """Blocking read from the Orchestrator output_queue with timeout."""
+    async def try_get_output_async(self) -> dict[str, Any] | None:
+        """Async read from the Orchestrator output queue."""
+        if self.output_queue is None:
+            return None
         try:
-            fut = asyncio.run_coroutine_threadsafe(
-                asyncio.wait_for(self.output_queue.get(), timeout=timeout),
-                self._orch_loop,
-            )
-            return fut.result(timeout=timeout + 0.1)
-        except Exception:
+            return self.output_queue.sync_q.get_nowait()
+        except queue.Empty:
             return None
 
     def get_stage_metadata(self, stage_id: int) -> dict[str, Any]:
@@ -418,24 +455,39 @@ class AsyncOmniEngine:
 
     def abort(self, request_ids: list[str]) -> None:
         """Send abort message to the Orchestrator."""
-        self._put_to_request_queue(
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        self.request_queue.sync_q.put_nowait(
             {
                 "type": "abort",
                 "request_ids": request_ids,
             }
         )
 
+    async def abort_async(self, request_ids: list[str]) -> None:
+        """Async abort API."""
+        self.abort(request_ids)
+
     def shutdown(self) -> None:
         """Send shutdown message and wait for the Orchestrator thread to exit."""
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
         try:
-            self._put_to_request_queue({"type": "shutdown"})
+            if self.request_queue is not None:
+                self.request_queue.sync_q.put_nowait({"type": "shutdown"})
         except Exception:
             pass
         if hasattr(self, "orchestrator_thread") and self.orchestrator_thread.is_alive():
             self.orchestrator_thread.join(timeout=10)
             if self.orchestrator_thread.is_alive():
                 logger.warning("[AsyncOmniEngine] Orchestrator thread did not exit in time")
+
+        for q in (self.request_queue, self.output_queue):
+            if q is None:
+                continue
+            try:
+                q.close()
+            except Exception:
+                pass
 
     def __del__(self) -> None:
         try:

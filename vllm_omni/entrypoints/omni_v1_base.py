@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import types
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from pprint import pformat
 from typing import Any, Literal
 
@@ -131,47 +131,6 @@ class OmniV1Base:
             )
         return normalized
 
-    def _create_request_state(
-        self,
-        request_id: str,
-        wall_start_ts: float,
-        final_stage_id_for_e2e: int,
-    ) -> ClientRequestState:
-        metrics = OrchestratorMetrics(
-            self.num_stages,
-            self.log_stats,
-            wall_start_ts,
-            final_stage_id_for_e2e,
-        )
-        req_state = ClientRequestState(request_id)
-        req_state.metrics = metrics
-        self.request_states[request_id] = req_state
-        return req_state
-
-    def submit_request(
-        self,
-        request_id: str,
-        prompt: Any,
-        sampling_params_list: Sequence[Any],
-        final_stage_id_for_e2e: int,
-        wall_start_ts: float,
-    ) -> tuple[ClientRequestState, float]:
-        req_state = self._create_request_state(
-            request_id=request_id,
-            wall_start_ts=wall_start_ts,
-            final_stage_id_for_e2e=final_stage_id_for_e2e,
-        )
-        self.engine.add_request(
-            request_id=request_id,
-            prompt=prompt,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id_for_e2e,
-        )
-        submit_ts = time.time()
-        if req_state.metrics is not None:
-            req_state.metrics.stage_first_ts[0] = submit_ts
-        return req_state, submit_ts
-
     def _log_summary_and_cleanup(self, request_id: str) -> None:
         req_state = self.request_states.get(request_id)
         try:
@@ -187,17 +146,6 @@ class OmniV1Base:
             )
         finally:
             self.request_states.pop(request_id, None)
-
-    def _abort_requests(self, request_id: str | Iterable[str]) -> list[str]:
-        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
-        if not request_ids:
-            return []
-        self.engine.abort(request_ids)
-        for req_id in request_ids:
-            self.request_states.pop(req_id, None)
-        if self.log_stats:
-            logger.info("[%s] Aborted request(s) %s", self.__class__.__name__, ",".join(request_ids))
-        return request_ids
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(

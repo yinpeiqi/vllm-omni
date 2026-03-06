@@ -14,6 +14,7 @@ import time as _time
 from dataclasses import dataclass, field
 from typing import Any
 
+import janus
 import torch
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
@@ -178,16 +179,16 @@ class Orchestrator:
 
     def __init__(
         self,
-        request_queue: asyncio.Queue,
-        output_queue: asyncio.Queue,
+        request_async_queue: janus.AsyncQueue[dict[str, Any]],
+        output_async_queue: janus.AsyncQueue[dict[str, Any]],
         stage_clients: list[Any],
         output_processors: list[Any],
         stage_vllm_configs: list[Any],
         *,
         async_chunk: bool = False,
     ) -> None:
-        self.request_queue = request_queue
-        self.output_queue = output_queue
+        self.request_async_queue = request_async_queue
+        self.output_async_queue = output_async_queue
 
         self.num_stages = len(stage_clients)
         self.async_chunk = bool(async_chunk)
@@ -244,9 +245,9 @@ class Orchestrator:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     async def _request_handler(self) -> None:
-        """Read messages from the main thread via request_queue."""
+        """Read messages from the main thread via request_async_queue."""
         while True:
-            msg = await self.request_queue.get()
+            msg = await self.request_async_queue.get()
             msg_type = msg.get("type")
 
             if msg_type == "add_request":
@@ -358,7 +359,7 @@ class Orchestrator:
         stage_client = self.stage_clients[stage_id]
 
         if stage_client.final_output:
-            await self.output_queue.put(
+            await self.output_async_queue.put(
                 {
                     "type": "output",
                     "request_id": req_id,
@@ -370,7 +371,7 @@ class Orchestrator:
                 }
             )
         elif stage_metrics is not None:
-            await self.output_queue.put(
+            await self.output_async_queue.put(
                 {
                     "type": "stage_metrics",
                     "request_id": req_id,

@@ -10,7 +10,9 @@ from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_v1_base import OmniV1Base
+from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -113,15 +115,24 @@ class OmniV1(OmniV1Base):
                 final_stage_id = self._compute_final_stage_id(prompt_modalities)
                 req_final_stage_ids[req_id] = final_stage_id
 
-                req_state, submit_ts = self.submit_request(
+                metrics = OrchestratorMetrics(
+                    self.num_stages,
+                    self.log_stats,
+                    wall_start_ts,
+                    final_stage_id,
+                )
+                req_state = ClientRequestState(req_id)
+                req_state.metrics = metrics
+                self.request_states[req_id] = req_state
+
+                self.engine.add_request(
                     request_id=req_id,
                     prompt=prompt,
                     sampling_params_list=sampling_params_list,
-                    final_stage_id_for_e2e=final_stage_id,
-                    wall_start_ts=wall_start_ts,
+                    final_stage_id=final_stage_id,
                 )
-                if req_state.metrics is None:
-                    raise RuntimeError(f"Missing metrics for request {req_id}")
+                submit_ts = time.time()
+                req_state.metrics.stage_first_ts[0] = submit_ts
                 req_start_ts[req_id] = submit_ts
 
             active_reqs = set(request_ids)
@@ -131,7 +142,7 @@ class OmniV1(OmniV1Base):
                 pbar = tqdm_func(total=len(request_ids), desc="Processed prompts", dynamic_ncols=True)
 
             while active_reqs:
-                msg = self.engine.try_get_output_blocking(timeout=0.01)
+                msg = self.engine.try_get_output()
 
                 should_continue, req_id, stage_id, req_state = self._handle_output_message(msg)
                 if should_continue:
@@ -168,7 +179,12 @@ class OmniV1(OmniV1Base):
                 pbar.close()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
-        self._abort_requests(request_id)
+        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        self.engine.abort(request_ids)
+        for req_id in request_ids:
+            self.request_states.pop(req_id, None)
+        if self.log_stats:
+            logger.info("[OmniV1] Aborted request(s) %s", ",".join(request_ids))
 
     def __del__(self):
         try:
