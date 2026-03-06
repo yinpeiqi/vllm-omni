@@ -18,6 +18,7 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
 
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_v1_base import (
     OmniV1Base,
     omni_snapshot_download as _omni_snapshot_download,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 logger = init_logger(__name__)
+_FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 
 
 def omni_snapshot_download(model_id: str) -> str:
@@ -151,18 +153,25 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
             # Determine the final stage for E2E stats
             final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
 
+            metrics = OrchestratorMetrics(
+                self.num_stages,
+                self.log_stats,
+                wall_start_ts,
+                final_stage_id_for_e2e,
+            )
+            req_state = ClientRequestState(request_id)
+            req_state.metrics = metrics
+            self.request_states[request_id] = req_state
+
             # Add request to stage 0 (Orchestrator handles all stage transitions)
-            logger.info("[AsyncOmniV1] submit request %s to stage-0", request_id)
-            req_state, submit_ts = self.submit_request(
+            await self.engine.add_request_async(
                 request_id=request_id,
                 prompt=prompt,
                 sampling_params_list=sampling_params_list,
-                final_stage_id_for_e2e=final_stage_id_for_e2e,
-                wall_start_ts=wall_start_ts,
+                final_stage_id=final_stage_id_for_e2e,
             )
-            if req_state.metrics is None:
-                raise RuntimeError(f"Missing metrics for request {request_id}")
-            metrics = req_state.metrics
+            submit_ts = time.time()
+            req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
 
             # Process results based on mode
@@ -276,12 +285,12 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
-            loop = asyncio.get_event_loop()
             try:
                 while True:
-                    # Blocking read with timeout (runs in executor to avoid
-                    # blocking the event loop)
-                    msg = await loop.run_in_executor(None, engine.try_get_output_blocking)
+                    msg = await engine.try_get_output_async()
+                    if msg is None:
+                        await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
+                        continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)
                     if should_continue:
@@ -292,6 +301,8 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
                     # Route to the per-request queue
                     await req_state.queue.put(msg)
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.exception("[AsyncOmniV1] final_output_loop failed.")
                 for req_state in list(self.request_states.values()):
@@ -306,7 +317,12 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort request(s) via the Orchestrator."""
-        self._abort_requests(request_id)
+        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        await self.engine.abort_async(request_ids)
+        for req_id in request_ids:
+            self.request_states.pop(req_id, None)
+        if self.log_stats:
+            logger.info("[AsyncOmniV1] Aborted request(s) %s", ",".join(request_ids))
 
     async def pause_generation(
         self,
