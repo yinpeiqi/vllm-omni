@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pprint import pformat
 from typing import Any, Literal
 
+import huggingface_hub
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -14,6 +15,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -24,13 +26,27 @@ def _dummy_snapshot_download(model_id: str) -> str:
 
 
 def omni_snapshot_download(model_id: str) -> str:
+    if os.path.exists(model_id):
+        return model_id
+
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
     if os.environ.get("VLLM_USE_MODELSCOPE", False):
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)
-    return _dummy_snapshot_download(model_id)
+
+    try:
+        download_weights_from_hf_specific(
+            model_name_or_path=model_id,
+            cache_dir=None,
+            allow_patterns=["*"],
+            require_all=True,
+        )
+    except huggingface_hub.errors.RepositoryNotFoundError:
+        logger.warning("Repository not found for '%s'.", model_id)
+
+    return model_id
 
 
 OutputMessageHandleResult = (
