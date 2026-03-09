@@ -125,10 +125,16 @@ class OmniV1Base:
         self,
         sampling_params_list: Sequence[Any] | Any | None,
     ) -> Sequence[Any]:
-        if sampling_params_list is None or not isinstance(sampling_params_list, Sequence):
+        if sampling_params_list is None:
             normalized = self.default_sampling_params_list
-        else:
+        elif isinstance(sampling_params_list, Sequence) and not isinstance(sampling_params_list, (str, bytes)):
             normalized = sampling_params_list
+        elif self.num_stages == 1:
+            normalized = [sampling_params_list]
+        else:
+            raise ValueError(
+                f"Expected {self.num_stages} sampling params, got a single sampling params object"
+            )
         if len(normalized) != self.num_stages:
             raise ValueError(
                 f"Expected {self.num_stages} sampling params, got {len(normalized)}"

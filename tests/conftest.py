@@ -38,7 +38,7 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 
-from vllm_omni.entrypoints.omni import Omni
+from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -1733,6 +1733,8 @@ class OmniRunner:
         Returns:
             List of SamplingParams with default decoding for each stage
         """
+        if hasattr(self.omni, "default_sampling_params_list"):
+            return list(self.omni.default_sampling_params_list)
         return [st.default_sampling_params for st in self.omni.stage_list]
 
     def get_omni_inputs(
