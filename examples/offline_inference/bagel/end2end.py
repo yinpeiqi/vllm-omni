@@ -88,7 +88,7 @@ def main():
 
     from PIL import Image
 
-    from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni import Omni
 
     omni_kwargs = {}
     if args.stage_configs_path:

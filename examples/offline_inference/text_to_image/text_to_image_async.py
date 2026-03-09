@@ -10,16 +10,10 @@ from pathlib import Path
 
 import torch
 
+from vllm_omni import AsyncOmni as AsyncOmniCls
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
-
-USE_V1 = os.getenv("VLLM_OMNI_USE_V1") == "1"
-
-if USE_V1:
-    from vllm_omni.entrypoints.async_omni_v1 import AsyncOmniV1 as AsyncOmniCls
-else:
-    from vllm_omni.entrypoints.async_omni import AsyncOmni as AsyncOmniCls
 
 
 def parse_args() -> argparse.Namespace:

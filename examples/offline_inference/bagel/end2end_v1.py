@@ -10,12 +10,8 @@ import uuid
 
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-if os.getenv("VLLM_OMNI_USE_V1") == "1":
-    from vllm_omni.entrypoints.async_omni_v1 import AsyncOmniV1 as AsyncOmni
-else:
-    from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 
 async def main():

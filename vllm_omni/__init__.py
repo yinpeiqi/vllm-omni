@@ -12,6 +12,8 @@ Architecture:
   processing
 """
 
+import os
+
 try:
     from . import patch  # noqa: F401
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
@@ -24,10 +26,20 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
 
 from .config import OmniModelConfig
-from .entrypoints.async_omni import AsyncOmni
 
-# Main entry points
-from .entrypoints.omni import Omni
+
+def _use_v1_entrypoints() -> bool:
+    value = os.environ.get("VLLM_OMNI_USE_V1", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+if _use_v1_entrypoints():
+    from .entrypoints.async_omni_v1 import AsyncOmniV1 as AsyncOmni
+    from .entrypoints.omni_v1 import OmniV1 as Omni
+else:
+    from .entrypoints.async_omni import AsyncOmni
+    from .entrypoints.omni import Omni
+
 
 from .version import __version__, __version_tuple__  # isort:skip
 

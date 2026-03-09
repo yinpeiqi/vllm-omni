@@ -21,7 +21,7 @@ from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.entrypoints.omni import Omni
+from vllm_omni import Omni
 
 SEED = 42
 
