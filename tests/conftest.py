@@ -1976,9 +1976,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output[0].outputs[0].text
+                    text_content = stage_output.request_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output[0].outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
 
             result.audio_content = audio_content
             result.text_content = text_content
