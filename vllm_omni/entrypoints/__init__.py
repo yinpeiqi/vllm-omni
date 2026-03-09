@@ -10,16 +10,29 @@ Provides high-level interfaces for running omni models including:
 - Omni: Unified entrypoint that auto-selects between LLM and Diffusion
 """
 
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+import os
+
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni_v1 import AsyncOmniV1
-from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_v1 import OmniV1
+
+
+def _use_v1_entrypoints() -> bool:
+    value = os.environ.get("vllm_omni_use_v1")
+    if value is None:
+        value = os.environ.get("VLLM_OMNI_USE_V1", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+if _use_v1_entrypoints():
+    AsyncOmni = AsyncOmniV1
+    Omni = OmniV1
+else:
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.omni import Omni
 
 __all__ = [
     "AsyncOmni",
     "AsyncOmniDiffusion",
     "Omni",
-    "AsyncOmniV1",
-    "OmniV1",
 ]

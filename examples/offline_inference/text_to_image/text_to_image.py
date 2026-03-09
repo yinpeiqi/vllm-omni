@@ -9,17 +9,12 @@ from typing import Any
 
 import torch
 
+from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.platforms import current_omni_platform
-
-USE_V1 = os.getenv("VLLM_OMNI_USE_V1") == "1"
-if USE_V1:
-    from vllm_omni.entrypoints.omni_v1 import OmniV1 as Omni
-else:
-    from vllm_omni.entrypoints.omni import Omni
 
 
 def is_nextstep_model(model_name: str) -> bool:

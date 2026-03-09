@@ -20,11 +20,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-USE_V1 = os.getenv("VLLM_OMNI_USE_V1") == "1"
-if USE_V1:
-    from vllm_omni.entrypoints.omni_v1 import OmniV1 as Omni
-else:
-    from vllm_omni.entrypoints.omni import Omni
+from vllm_omni import Omni
 
 SEED = 42
 
