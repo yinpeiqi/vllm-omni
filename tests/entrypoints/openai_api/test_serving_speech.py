@@ -487,7 +487,7 @@ class TestTTSMethods:
     def speech_server(self, mocker: MockerFixture):
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
         mock_engine_client.tts_max_instructions_length = None
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
@@ -499,7 +499,7 @@ class TestTTSMethods:
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
-        # Fixture creates server with stage_list = None -> _is_tts should be False
+        # Fixture creates server with stage_configs = [] -> _is_tts should be False
         assert speech_server._is_tts is False
         assert speech_server._tts_stage is None
 
@@ -511,9 +511,9 @@ class TestTTSMethods:
 
         # Create a TTS stage
         mock_stage = mocker.MagicMock()
-        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.engine_args.model_stage = "qwen3_tts"
         mock_stage.tts_args = {}
-        mock_engine_client.stage_list = [mock_stage]
+        mock_engine_client.stage_configs = [mock_stage]
 
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
@@ -614,7 +614,7 @@ class TestTTSMethods:
         """Test _load_supported_speakers."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
 
         # Mock talker_config with mixed-case speaker names
         mock_talker_config = mocker.MagicMock()
@@ -757,7 +757,7 @@ class TestTTSMethods:
         """Test CLI override (stored in engine_client) takes highest priority."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
         # CLI override is stored in engine_client
         mock_engine_client.tts_max_instructions_length = 1000
         mock_models = mocker.MagicMock()
@@ -781,9 +781,9 @@ class TestTTSMethods:
 
         # Mock stage with tts_args
         mock_stage = mocker.MagicMock()
-        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.engine_args.model_stage = "qwen3_tts"
         mock_stage.tts_args = {"max_instructions_length": 750}
-        mock_engine_client.stage_list = [mock_stage]
+        mock_engine_client.stage_configs = [mock_stage]
 
         server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
@@ -804,9 +804,9 @@ class TestTTSMethods:
 
         # Mock stage with tts_args
         mock_stage = mocker.MagicMock()
-        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.engine_args.model_stage = "qwen3_tts"
         mock_stage.tts_args = {"max_instructions_length": 750}
-        mock_engine_client.stage_list = [mock_stage]
+        mock_engine_client.stage_configs = [mock_stage]
 
         server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
@@ -820,7 +820,7 @@ class TestTTSMethods:
         """Test instructions length validation uses cached _max_instructions_length."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
         # CLI override with max length of 10 characters
         mock_engine_client.tts_max_instructions_length = 10
         mock_models = mocker.MagicMock()

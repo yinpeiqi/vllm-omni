@@ -16,6 +16,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
+from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -96,14 +97,33 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         self._paused: bool = False
         self.final_output_task: asyncio.Task | None = None
 
+        self.config_path = self.engine.config_path
+        self.stage_configs = self.engine.stage_configs
+        self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
+        self.input_processor = self.engine.input_processor
+
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is None:
+            self.io_processor = None
+        else:
+            vllm_config = self.engine.stage_vllm_configs[stage_index]
+            io_processor_plugin = vllm_config.model_config.io_processor_plugin
+            self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+
+    def _get_comprehension_stage_index(self) -> int | None:
+        for idx, stage_client in enumerate(self.engine.stage_clients):
+            stage_vllm_config = self.engine.stage_vllm_configs[idx]
+            if stage_vllm_config is None:
+                continue
+            if stage_client.is_comprehension:
+                return idx
+
+        return None
+
     @property
     def renderer(self):
-        """Renderer is required by EngineClient protocol.
-
-        AsyncOmniV1 is primarily an orchestrator over multiple EngineCore stages,
-        and currently does not expose a unified renderer.
-        """
-        raise NotImplementedError("AsyncOmniV1.renderer is not implemented.")
+        """Return the renderer from the engine input processor when available."""
+        return self.input_processor.renderer
 
     # ==================== Generate Method ====================
 
@@ -359,19 +379,19 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(self) -> None:
-        """Start profiling all stages.
+    async def start_profile(self, stages: list[int] | None = None) -> None:
+        """Start profiling specified stages.
 
         TODO: Forward to Orchestrator process via message.
         """
-        logger.warning("[AsyncOmniV1] start_profile not yet supported with Orchestrator process")
+        logger.warning("[AsyncOmniV1] start_profile not yet supported with Orchestrator process (stages=%s)", stages)
 
-    async def stop_profile(self) -> None:
-        """Stop profiling all stages.
+    async def stop_profile(self, stages: list[int] | None = None) -> None:
+        """Stop profiling specified stages.
 
         TODO: Forward to Orchestrator process via message.
         """
-        logger.warning("[AsyncOmniV1] stop_profile not yet supported with Orchestrator process")
+        logger.warning("[AsyncOmniV1] stop_profile not yet supported with Orchestrator process (stages=%s)", stages)
 
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache for all stages.
@@ -453,29 +473,31 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
     # ==================== EngineClient Interface ====================
 
     async def get_vllm_config(self) -> VllmConfig:
-        """Get vllm config.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        return None  # type: ignore[return-value]
+        """Get vllm config for the comprehension stage."""
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is None:
+            return None  # type: ignore[return-value]
+        return self.engine.stage_vllm_configs[stage_index]
 
     async def get_model_config(self) -> Any:
-        """Get model config.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        return None
+        """Get model config for the comprehension stage."""
+        vllm_config = await self.get_vllm_config()
+        if vllm_config is not None:
+            return vllm_config.model_config
+        return self.model_config
 
     async def get_input_preprocessor(self) -> InputPreprocessor:
         """Get input preprocessor."""
-        return None  # TODO: Implement if needed
+        return self.input_processor
 
     async def get_tokenizer(self) -> TokenizerLike:
-        """Get tokenizer.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        return None  # type: ignore[return-value]
+        """Get tokenizer for the comprehension stage."""
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is not None:
+            tokenizer = self.engine.output_processors[stage_index].tokenizer
+            if tokenizer is not None:
+                return tokenizer
+        return self.input_processor.tokenizer  # type: ignore[return-value]
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""

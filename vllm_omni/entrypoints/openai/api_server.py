@@ -81,7 +81,7 @@ from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
@@ -386,13 +386,13 @@ async def omni_init_app_state(
 
     # Detect if it's pure Diffusion mode (single stage and is Diffusion)
     is_pure_diffusion = False
-    if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
-        stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = stage_configs[0].get("stage_type", "llm")
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+    stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+    if stage_configs and len(stage_configs) == 1:
+        stage_cfg = stage_configs[0]
+        stage_type = stage_cfg.get("stage_type", "llm") if hasattr(stage_cfg, "get") else getattr(stage_cfg, "stage_type", "llm")
+        if stage_type == "diffusion":
+            is_pure_diffusion = True
+            logger.info("Detected pure diffusion mode (single diffusion stage)")
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -410,7 +410,7 @@ async def omni_init_app_state(
     state.args = args
 
     # For omni models
-    state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+    state.stage_configs = stage_configs
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
@@ -427,11 +427,10 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
-        diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
-            stage_configs=diffusion_stage_configs,
+            stage_configs=stage_configs,
         )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
@@ -473,57 +472,6 @@ async def omni_init_app_state(
         else {}
     )
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
-
-    # Ensure input_processor, io_processor, and model_config exist for OpenAIServingModels compatibility
-    if (
-        not hasattr(engine_client, "input_processor")
-        or engine_client.input_processor is None
-        or not hasattr(engine_client, "io_processor")
-        or engine_client.io_processor is None
-        or not hasattr(engine_client, "model_config")
-        or engine_client.model_config is None
-    ):
-        if vllm_config is not None:
-            # Try to initialize processors if vllm_config is available
-            try:
-                from vllm.plugins.io_processors import get_io_processor
-
-                from vllm_omni.engine.input_processor import OmniInputProcessor
-
-                tokenizer = await engine_client.get_tokenizer()
-                if tokenizer is not None:
-                    # Initialize input_processor
-                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
-                    if not hasattr(engine_client, "input_processor") or engine_client.input_processor is None:
-                        engine_client.input_processor = OmniInputProcessor(
-                            vllm_config=vllm_config,
-                        )
-                        logger.info("Initialized input_processor for AsyncOmni")
-
-                    # Initialize model_config
-                    if not hasattr(engine_client, "model_config") or engine_client.model_config is None:
-                        engine_client.model_config = vllm_config.model_config
-                        logger.info("Initialized model_config for AsyncOmni")
-
-                    # Initialize io_processor
-                    if not hasattr(engine_client, "io_processor") or engine_client.io_processor is None:
-                        model_config = (
-                            engine_client.model_config
-                            if hasattr(engine_client, "model_config")
-                            else vllm_config.model_config
-                        )
-                        io_processor_plugin = model_config.io_processor_plugin
-                        engine_client.io_processor = get_io_processor(vllm_config, io_processor_plugin)
-                        logger.info("Initialized io_processor for AsyncOmni")
-                else:
-                    logger.warning("Cannot initialize processors: tokenizer is None. OpenAIServingModels may fail.")
-            except Exception as e:
-                logger.warning(
-                    "Failed to initialize processors for AsyncOmni: %s. OpenAIServingModels may fail.",
-                    e,
-                )
-        else:
-            logger.warning("Cannot initialize processors: vllm_config is None. OpenAIServingModels may fail.")
 
     state.openai_serving_models = OpenAIServingModels(
         engine_client=engine_client,
@@ -1249,7 +1197,7 @@ async def edit_images(
 def _get_engine_and_model(raw_request: Request):
     # Get engine client (AsyncOmni) from app state
     engine_client: EngineClient | AsyncOmni | None = getattr(raw_request.app.state, "engine_client", None)
-    if engine_client is None or not hasattr(engine_client, "stage_list"):
+    if engine_client is None:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
             detail="Multi-stage engine not initialized. Start server with a multi-stage omni model.",
@@ -1267,21 +1215,7 @@ def _get_engine_and_model(raw_request: Request):
     has_diffusion_stage = False
     stage_types: list[str] = []
     for stage in stage_configs:
-        # Handle both dict and OmegaConf objects
-        stage_type = None
-        if isinstance(stage, dict):
-            stage_type = stage.get("stage_type", "llm")
-        elif hasattr(stage, "get"):
-            stage_type = stage.get("stage_type", "llm")
-        elif hasattr(stage, "stage_type"):
-            stage_type = stage.stage_type
-        else:
-            # Fallback: try to access as dict-like
-            try:
-                stage_type = stage["stage_type"] if "stage_type" in stage else "llm"
-            except (TypeError, KeyError):
-                stage_type = "llm"
-
+        stage_type = stage.stage_type
         if stage_type == "diffusion":
             has_diffusion_stage = True
         stage_types.append(stage_type)
@@ -1357,41 +1291,33 @@ async def _generate_with_async_omni(
 ):
     engine_client = cast(AsyncOmni, engine_client)
     result = None
-    stage_list = getattr(engine_client, "stage_list", None)
-    if isinstance(stage_list, list):
-        default_params_list: list[OmniSamplingParams] | None = getattr(
-            engine_client, "default_sampling_params_list", None
-        )
-        if not isinstance(default_params_list, list):
-            default_params_list = [
-                OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types
-            ]
-        else:
-            default_params_list = list(default_params_list)
-        if len(default_params_list) != len(stage_types):
-            default_params_list = (
-                default_params_list
-                + [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
-            )[: len(stage_types)]
-
-        sampling_params_list: list[OmniSamplingParams] = []
-        for idx, stage_type in enumerate(stage_types):
-            if stage_type == "diffusion":
-                sampling_params_list.append(gen_params)
-            else:
-                base_params = default_params_list[idx]
-                sampling_params_list.append(base_params)
-
-        async for output in engine_client.generate(
-            sampling_params_list=sampling_params_list,
-            **kwargs,
-        ):
-            result = output
+    default_params_list: list[OmniSamplingParams] | None = getattr(
+        engine_client, "default_sampling_params_list", None
+    )
+    if not isinstance(default_params_list, list):
+        default_params_list = [
+            OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types
+        ]
     else:
-        result = await engine_client.generate(
-            sampling_params_list=[gen_params],
-            **kwargs,
-        )
+        default_params_list = list(default_params_list)
+    if len(default_params_list) != len(stage_types):
+        default_params_list = (
+            default_params_list
+            + [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
+        )[: len(stage_types)]
+
+    sampling_params_list: list[OmniSamplingParams] = []
+    for idx, stage_type in enumerate(stage_types):
+        if stage_type == "diffusion":
+            sampling_params_list.append(gen_params)
+        else:
+            sampling_params_list.append(default_params_list[idx])
+
+    async for output in engine_client.generate(
+        sampling_params_list=sampling_params_list,
+        **kwargs,
+    ):
+        result = output
 
     if result is None:
         raise HTTPException(

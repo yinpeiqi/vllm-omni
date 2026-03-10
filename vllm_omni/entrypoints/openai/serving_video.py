@@ -13,7 +13,7 @@ from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoData,
@@ -39,7 +39,7 @@ class OmniOpenAIServingVideo:
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
-        self._stage_configs = stage_configs
+        self._stage_configs = engine_client.stage_configs if stage_configs is None else stage_configs
 
     @classmethod
     def for_diffusion(
@@ -171,11 +171,9 @@ class OmniOpenAIServingVideo:
             return self._model_name
         if raw_request is None:
             return None
-        serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
-        if serving_models and getattr(serving_models, "base_model_paths", None):
-            base_paths = serving_models.base_model_paths
-            if base_paths:
-                return base_paths[0].name
+        base_paths = raw_request.app.state.openai_serving_models.base_model_paths
+        if base_paths:
+            return base_paths[0].name
         return None
 
     @staticmethod
@@ -239,50 +237,29 @@ class OmniOpenAIServingVideo:
         request_id: str,
         raw_request: Request | None,
     ) -> Any:
-        has_stage_list = hasattr(self._engine_client, "stage_list")
         logger.info(
-            "Video generation routing: stage_configs=%s, has_stage_list=%s, engine_type=%s",
-            "present"
-            if (self._stage_configs or (getattr(raw_request.app.state, "stage_configs", None) if raw_request else None))
-            else "missing",
-            has_stage_list,
+            "Video generation routing: num_stages=%s, engine_type=%s",
+            len(self._stage_configs),
             type(self._engine_client).__name__,
         )
-        stage_configs = (
-            self._stage_configs
-            or (getattr(raw_request.app.state, "stage_configs", None) if raw_request else None)
-            or getattr(self._engine_client, "stage_configs", None)
-        )
 
-        if not stage_configs:
-            if not hasattr(self._engine_client, "stage_list"):
-                raise HTTPException(
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                    detail="Stage configs not found. Start server with an omni diffusion model.",
-                )
+        if not self._stage_configs:
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                detail="Stage configs not found. Start server with an omni diffusion model.",
+            )
 
         # Video generation endpoint only supports diffusion stages.
-        if stage_configs:
-            for stage in stage_configs:
-                # Extract stage_type: dicts and OmegaConf objects use .get(), others use getattr
-                if hasattr(stage, "get"):
-                    stage_type = stage.get("stage_type", "llm")
-                else:
-                    stage_type = getattr(stage, "stage_type", "llm")
-
-                if stage_type != "diffusion":
-                    raise HTTPException(
-                        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                        detail=f"Video generation only supports diffusion stages, found '{stage_type}' stage.",
-                    )
+        for stage in self._stage_configs:
+            if stage.stage_type != "diffusion":
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    detail=f"Video generation only supports diffusion stages, found '{stage.stage_type}' stage.",
+                )
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
-        stage_list = getattr(engine_client, "stage_list", None)
-        if isinstance(stage_list, list):
-            sampling_params_list: list[OmniSamplingParams] = [gen_params for _ in stage_list]
-        else:
-            sampling_params_list = [gen_params]
+        sampling_params_list: list[OmniSamplingParams] = [gen_params for _ in self._stage_configs]
 
         result = None
         async for output in engine_client.generate(
