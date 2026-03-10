@@ -21,11 +21,30 @@ import janus
 from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
+from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.stage_init import StartedLlmStage, close_started_llm_stage
+from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_init import (
+    StartedLlmStage,
+    acquire_device_locks,
+    build_engine_args_dict,
+    build_vllm_config,
+    cleanup_failed_stage_initialization,
+    close_started_llm_stage,
+    extract_stage_metadata,
+    finalize_initialized_stages,
+    get_stage_connector_spec,
+    initialize_diffusion_stage,
+    load_omni_transfer_config_for_model,
+    prepare_engine_environment,
+    release_device_locks,
+    setup_stage_devices,
+)
 from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
@@ -70,16 +89,6 @@ class AsyncOmniEngine:
         stage_init_timeout: int,
     ) -> StartedLlmStage:
         """Launch one LLM stage to READY state in a helper thread."""
-        from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
-
-        from vllm_omni.engine.stage_init import (
-            acquire_device_locks,
-            build_vllm_config,
-            close_started_llm_stage,
-            release_device_locks,
-            setup_stage_devices,
-        )
-        from vllm_omni.entrypoints.stage_utils import _to_dict
         from vllm_omni.platforms import current_omni_platform
 
         started_stage: StartedLlmStage | None = None
@@ -91,13 +100,17 @@ class AsyncOmniEngine:
                 previous_visible_devices = os.environ.get(device_control_env)
                 try:
                     setup_stage_devices(metadata.stage_id, metadata.runtime_cfg)
-                    vllm_config, executor_class = build_vllm_config(
+                    engine_args_dict = build_engine_args_dict(
                         stage_cfg,
                         self.model,
                         stage_connector_spec=stage_connector_spec,
                     )
-                    engine_args_dict = _to_dict(stage_cfg.engine_args)
-                    engine_args_dict["model"] = self.model
+                    vllm_config, executor_class = build_vllm_config(
+                        stage_cfg,
+                        self.model,
+                        stage_connector_spec=stage_connector_spec,
+                        engine_args_dict=engine_args_dict,
+                    )
                     lock_fds = acquire_device_locks(
                         metadata.stage_id,
                         engine_args_dict,
@@ -144,9 +157,6 @@ class AsyncOmniEngine:
         started: StartedLlmStage,
     ) -> tuple[Any, Any, Any, InputProcessor | None]:
         """Attach a READY LLM stage to the orchestrator event loop."""
-        from vllm.tokenizers import cached_tokenizer_from_config
-
-        from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 
         client_addresses = {
             "input_address": started.addresses.inputs[0],
@@ -201,27 +211,17 @@ class AsyncOmniEngine:
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self."""
-        from vllm_omni.engine.stage_init import (
-            cleanup_failed_stage_initialization,
-            extract_stage_metadata,
-            finalize_initialized_stages,
-            get_stage_connector_spec,
-            initialize_diffusion_stage,
-            load_omni_transfer_config_for_model,
-            prepare_engine_environment,
-            setup_stage_devices,
-        )
 
-        num_stages = len(self.stage_configs)
+        num_stages = self.num_stages
         stage_clients: list[Any | None] = [None] * num_stages
         output_processors: list[Any | None] = [None] * num_stages
         stage_vllm_configs: list[Any | None] = [None] * num_stages
         input_processor: InputProcessor | None = None
-        llm_launch_futures: list[concurrent.futures.Future[StartedLlmStage]] = []
-        started_llm_stages: list[StartedLlmStage] = []
+        llm_stage_ids: list[int] = []
+        llm_launch_futures: dict[int, concurrent.futures.Future[StartedLlmStage]] = {}
+        started_llm_stages: dict[int, StartedLlmStage] = {}
 
-        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if num_stages > 0 else None
-        async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        async_chunk = self.async_chunk
         llm_stage_count = sum(
             1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
         )
@@ -250,26 +250,26 @@ class AsyncOmniEngine:
                         logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion)", stage_id)
                         continue
 
-                    llm_launch_futures.append(
-                        launch_executor.submit(
-                            self._launch_llm_stage,
-                            stage_cfg,
-                            metadata,
-                            stage_connector_spec,
-                            stage_init_timeout,
-                        )
+                    llm_stage_ids.append(stage_id)
+                    llm_launch_futures[stage_id] = launch_executor.submit(
+                        self._launch_llm_stage,
+                        stage_cfg,
+                        metadata,
+                        stage_connector_spec,
+                        stage_init_timeout,
                     )
 
-                concurrent.futures.wait(llm_launch_futures)
+                concurrent.futures.wait(list(llm_launch_futures.values()))
 
-                for future in llm_launch_futures:
-                    started_llm_stages.append(future.result())
+                for stage_id in llm_stage_ids:
+                    started_llm_stages[stage_id] = llm_launch_futures[stage_id].result()
 
-            for started in started_llm_stages:
+            for stage_id in llm_stage_ids:
+                started = started_llm_stages[stage_id]
                 stage_client, output_processor, vllm_config, stage0_input_processor = self._attach_llm_stage(started)
-                stage_clients[started.stage_id] = stage_client
-                output_processors[started.stage_id] = output_processor
-                stage_vllm_configs[started.stage_id] = vllm_config
+                stage_clients[stage_id] = stage_client
+                output_processors[stage_id] = output_processor
+                stage_vllm_configs[stage_id] = vllm_config
                 if stage0_input_processor is not None:
                     input_processor = stage0_input_processor
 
@@ -278,20 +278,20 @@ class AsyncOmniEngine:
                 input_processor,
             )
         except Exception:
-            for future in llm_launch_futures:
+            for stage_id, future in llm_launch_futures.items():
                 if not future.done() or future.cancelled() or future.exception() is not None:
                     continue
-                started = future.result()
-                if all(existing.stage_id != started.stage_id for existing in started_llm_stages):
-                    started_llm_stages.append(started)
+                started_llm_stages.setdefault(stage_id, future.result())
             logger.exception(
                 "[AsyncOmniEngine] Stage initialization failed; shutting down %s initialized stage(s)",
                 len([stage_client for stage_client in stage_clients if stage_client is not None]),
             )
-            cleanup_failed_stage_initialization(stage_clients, started_llm_stages)
+            cleanup_failed_stage_initialization(
+                stage_clients,
+                [started_llm_stages[stage_id] for stage_id in llm_stage_ids if stage_id in started_llm_stages],
+            )
             raise
 
-        self.async_chunk = async_chunk
         self.stage_clients = initialized_stage_clients
         self.output_processors = output_processors
         self.stage_vllm_configs = stage_vllm_configs
@@ -306,7 +306,6 @@ class AsyncOmniEngine:
 
         self.default_sampling_params_list = default_sampling_params_list
         self.stage_metadata = stage_metadata
-        self.num_stages = len(stage_metadata)
 
     def _initialize_janus_queues(self) -> None:
         """Initialize janus queues inside orchestrator thread loop context."""
@@ -321,7 +320,6 @@ class AsyncOmniEngine:
         startup_future: concurrent.futures.Future,
     ) -> None:
         """Create loop, initialize stages, then run Orchestrator."""
-        from vllm_omni.engine.orchestrator import Orchestrator
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -455,7 +453,6 @@ class AsyncOmniEngine:
             raise
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
-        self.num_stages = len(self.stage_metadata)
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 

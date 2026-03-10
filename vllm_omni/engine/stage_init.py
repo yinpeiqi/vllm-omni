@@ -26,6 +26,7 @@ from vllm.v1.executor import Executor
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.omni_stage import _resolve_worker_cls
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
+from vllm_omni.entrypoints.utils import resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 
 logger = init_logger(__name__)
@@ -154,16 +155,12 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
         logger.warning("Device setup failed for stage %s: %s", stage_id, e)
 
 
-def build_vllm_config(
+def build_engine_args_dict(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
-) -> tuple[Any, type]:
-    """Build engine_args_dict, resolve worker class, create VllmConfig and executor_class.
-
-    Returns:
-        (vllm_config, executor_class)
-    """
+) -> dict[str, Any]:
+    """Build the normalized engine args dict for one stage."""
     engine_args = stage_config.engine_args
     stage_type = getattr(stage_config, "stage_type", "llm")
     stage_id = stage_config.stage_id
@@ -176,6 +173,28 @@ def build_vllm_config(
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args_dict)
+
+    return engine_args_dict
+
+
+def build_vllm_config(
+    stage_config: Any,
+    model: str,
+    stage_connector_spec: dict[str, Any] | None = None,
+    engine_args_dict: dict[str, Any] | None = None,
+) -> tuple[Any, type]:
+    """Build engine args, then create VllmConfig and executor_class.
+
+    Returns:
+        (vllm_config, executor_class)
+    """
+    stage_id = stage_config.stage_id
+    if engine_args_dict is None:
+        engine_args_dict = build_engine_args_dict(
+            stage_config,
+            model,
+            stage_connector_spec=stage_connector_spec,
+        )
 
     logger.info("[stage_init] Stage-%s engine_args_dict: %s", stage_id, engine_args_dict)
 
@@ -314,11 +333,9 @@ def release_device_locks(lock_fds: list[int]) -> None:
             pass
 
 
-
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
     """Load omni transfer config from an explicit path or resolved model config."""
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
-    from vllm_omni.entrypoints.utils import resolve_model_config_path
 
     try:
         resolved_config_path = config_path or resolve_model_config_path(model)
@@ -386,9 +403,7 @@ def finalize_initialized_stages(
         raise RuntimeError("Stage initialization completed with missing stage clients")
 
     initialized_stage_clients = [stage_client for stage_client in stage_clients if stage_client is not None]
-    default_sampling_params_list = [
-        stage_client.default_sampling_params for stage_client in initialized_stage_clients
-    ]
+    default_sampling_params_list = [stage_client.default_sampling_params for stage_client in initialized_stage_clients]
     stage_metadata = [
         {
             "final_output": stage_client.final_output,
