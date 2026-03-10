@@ -6,6 +6,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -66,7 +67,22 @@ class StageEngineCoreClient(AsyncMPClient):
             "[StageEngineCoreClient] Stage-%s initializing EngineCore",
             self.stage_id,
         )
-        super().__init__(vllm_config, executor_class, log_stats=False)
+        try:
+            super().__init__(vllm_config, executor_class, log_stats=False)
+        except Exception:
+            logger.exception(
+                "[StageEngineCoreClient] Stage-%s EngineCore init failed",
+                self.stage_id,
+            )
+            try:
+                self.shutdown()
+            except Exception as shutdown_error:
+                logger.warning(
+                    "[StageEngineCoreClient] Stage-%s cleanup after init failure failed: %s",
+                    self.stage_id,
+                    shutdown_error,
+                )
+            raise
         logger.info(
             "[StageEngineCoreClient] Stage-%s EngineCore running",
             self.stage_id,
@@ -119,3 +135,29 @@ class StageEngineCoreClient(AsyncMPClient):
             )
             for so in source_outputs
         ]
+
+    async def collective_rpc_async(
+        self,
+        method: str,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Best-effort control RPC shim for vLLM EngineCore stages.
+
+        TODO(AsyncOmniV1): expose a first-class EngineCore control channel for
+        methods not surfaced by upstream AsyncMPClient. For now we only invoke
+        methods that already exist on the client object.
+        """
+        kwargs = kwargs or {}
+        target = getattr(self, method, None)
+        if target is None:
+            return {
+                "supported": False,
+                "todo": True,
+                "reason": f"{self.__class__.__name__}.{method} is not exposed by AsyncMPClient",
+            }
+
+        result = target(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result

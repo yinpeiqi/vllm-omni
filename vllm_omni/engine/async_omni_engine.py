@@ -11,6 +11,8 @@ import asyncio
 import concurrent.futures
 import queue
 import threading
+import time
+import uuid
 from collections.abc import Sequence
 from typing import Any
 
@@ -98,80 +100,97 @@ class AsyncOmniEngine:
             logger.warning("[AsyncOmniEngine] Failed to load transfer config: %s", e)
             omni_transfer_config = None
 
-        for stage_id, stage_cfg in enumerate(self.stage_configs):
-            logger.info("[AsyncOmniEngine] Initializing stage %s", stage_id)
+        try:
+            for stage_id, stage_cfg in enumerate(self.stage_configs):
+                logger.info("[AsyncOmniEngine] Initializing stage %s", stage_id)
 
-            metadata = extract_stage_metadata(stage_cfg)
-            setup_stage_devices(stage_id, metadata.runtime_cfg)
-            stage_connector_spec: dict[str, Any] = {}
-            if async_chunk:
-                stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-                for cfg in stage_connectors_cfg.values():
-                    stage_connector_spec = dict(cfg.get("spec", {}))
-                    break
+                metadata = extract_stage_metadata(stage_cfg)
+                setup_stage_devices(stage_id, metadata.runtime_cfg)
+                stage_connector_spec: dict[str, Any] = {}
+                if async_chunk:
+                    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
+                    for cfg in stage_connectors_cfg.values():
+                        stage_connector_spec = dict(cfg.get("spec", {}))
+                        break
 
-            if metadata.stage_type == "diffusion":
-                from vllm_omni.diffusion.data import OmniDiffusionConfig
+                if metadata.stage_type == "diffusion":
+                    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-                od_config = OmniDiffusionConfig.from_kwargs(model=self.model, **_to_dict(stage_cfg.engine_args))
-                stage_client = StageDiffusionClient(self.model, od_config, metadata)
-                stage_clients.append(stage_client)
-                output_processors.append(None)
-                stage_vllm_configs.append(None)
-                logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion)", stage_id)
-                continue
+                    od_config = OmniDiffusionConfig.from_kwargs(model=self.model, **_to_dict(stage_cfg.engine_args))
+                    stage_client = StageDiffusionClient(self.model, od_config, metadata)
+                    stage_clients.append(stage_client)
+                    output_processors.append(None)
+                    stage_vllm_configs.append(None)
+                    logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion)", stage_id)
+                    continue
 
-            vllm_config, executor_class = build_vllm_config(
-                stage_cfg,
-                self.model,
-                stage_connector_spec=stage_connector_spec,
-            )
-
-            engine_args_dict = _to_dict(stage_cfg.engine_args)
-            engine_args_dict["model"] = self.model
-            lock_fds = acquire_device_locks(stage_id, engine_args_dict, stage_init_timeout)
-            try:
-                stage_client = StageEngineCoreClient(
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    metadata=metadata,
+                vllm_config, executor_class = build_vllm_config(
+                    stage_cfg,
+                    self.model,
+                    stage_connector_spec=stage_connector_spec,
                 )
-            finally:
-                release_device_locks(lock_fds)
 
-            if vllm_config.model_config.skip_tokenizer_init:
-                tokenizer = None
-            else:
-                tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
+                engine_args_dict = _to_dict(stage_cfg.engine_args)
+                engine_args_dict["model"] = self.model
+                lock_fds = acquire_device_locks(stage_id, engine_args_dict, stage_init_timeout)
+                try:
+                    stage_client = StageEngineCoreClient(
+                        vllm_config=vllm_config,
+                        executor_class=executor_class,
+                        metadata=metadata,
+                    )
+                finally:
+                    release_device_locks(lock_fds)
 
-            if stage_id == 0:
-                input_processor = InputProcessor(vllm_config=vllm_config)
+                stage_clients.append(stage_client)
 
-            stage_output_processor = MultimodalOutputProcessor(
-                tokenizer=tokenizer,
-                log_stats=False,
-                engine_core_output_type=metadata.engine_output_type,
+                if vllm_config.model_config.skip_tokenizer_init:
+                    tokenizer = None
+                else:
+                    tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
+
+                if stage_id == 0:
+                    input_processor = InputProcessor(vllm_config=vllm_config)
+
+                stage_output_processor = MultimodalOutputProcessor(
+                    tokenizer=tokenizer,
+                    log_stats=False,
+                    engine_core_output_type=metadata.engine_output_type,
+                )
+
+                output_processors.append(stage_output_processor)
+                stage_vllm_configs.append(vllm_config)
+                logger.info("[AsyncOmniEngine] Stage %s initialized", stage_id)
+
+            default_sampling_params_list = [sc.default_sampling_params for sc in stage_clients]
+            stage_metadata = [
+                {
+                    "final_output": sc.final_output,
+                    "final_output_type": sc.final_output_type,
+                    "stage_type": sc.stage_type,
+                }
+                for sc in stage_clients
+            ]
+
+            if not isinstance(input_processor, InputProcessor):
+                has_llm_stage = any(m.get("stage_type") != "diffusion" for m in stage_metadata)
+                if has_llm_stage:
+                    raise RuntimeError("Failed to initialize stage-0 InputProcessor for LLM pipeline")
+        except Exception:
+            logger.exception(
+                "[AsyncOmniEngine] Stage initialization failed; shutting down %s initialized stage(s)",
+                len(stage_clients),
             )
-
-            stage_clients.append(stage_client)
-            output_processors.append(stage_output_processor)
-            stage_vllm_configs.append(vllm_config)
-            logger.info("[AsyncOmniEngine] Stage %s initialized", stage_id)
-
-        default_sampling_params_list = [sc.default_sampling_params for sc in stage_clients]
-        stage_metadata = [
-            {
-                "final_output": sc.final_output,
-                "final_output_type": sc.final_output_type,
-                "stage_type": sc.stage_type,
-            }
-            for sc in stage_clients
-        ]
-
-        if not isinstance(input_processor, InputProcessor):
-            has_llm_stage = any(m.get("stage_type") != "diffusion" for m in stage_metadata)
-            if has_llm_stage:
-                raise RuntimeError("Failed to initialize stage-0 InputProcessor for LLM pipeline")
+            for cleanup_stage_id, stage_client in reversed(list(enumerate(stage_clients))):
+                try:
+                    stage_client.shutdown()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[AsyncOmniEngine] Failed to shutdown initialized stage %s after init failure: %s",
+                        cleanup_stage_id,
+                        cleanup_error,
+                    )
+            raise
 
         # Assign initialized runtime directly on engine instance.
         self.async_chunk = async_chunk
@@ -187,6 +206,7 @@ class AsyncOmniEngine:
         """Initialize janus queues inside orchestrator thread loop context."""
         self.request_queue = janus.Queue()
         self.output_queue = janus.Queue()
+        self.rpc_output_queue = janus.Queue()
         logger.debug("[AsyncOmniEngine] janus queues initialized in orchestrator thread loop")
 
     def _bootstrap_orchestrator(
@@ -207,6 +227,7 @@ class AsyncOmniEngine:
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,
+                rpc_async_queue=self.rpc_output_queue.async_q,
                 async_chunk=self.async_chunk,
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
@@ -225,11 +246,26 @@ class AsyncOmniEngine:
             try:
                 if self.output_queue is not None:
                     self.output_queue.sync_q.put_nowait({"type": "error", "error": "Orchestrator thread crashed"})
+                if self.rpc_output_queue is not None:
+                    self.rpc_output_queue.sync_q.put_nowait({"type": "error", "error": "Orchestrator thread crashed"})
             except Exception:
                 pass
             raise
         finally:
-            loop.close()
+            try:
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                if hasattr(loop, "shutdown_default_executor"):
+                    loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed during orchestrator loop cleanup")
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
 
     def __init__(
         self,
@@ -275,6 +311,8 @@ class AsyncOmniEngine:
         self.stage_metadata: list[dict[str, Any]] = []
         self.request_queue: janus.Queue[dict[str, Any]] | None = None
         self.output_queue: janus.Queue[dict[str, Any]] | None = None
+        self.rpc_output_queue: janus.Queue[dict[str, Any]] | None = None
+        self._rpc_lock = threading.Lock()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -296,7 +334,17 @@ class AsyncOmniEngine:
         try:
             startup_future.result(timeout=stage_init_timeout)
         except concurrent.futures.TimeoutError as e:
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
             raise TimeoutError(f"Orchestrator did not become ready within {stage_init_timeout}s") from e
+        except Exception:
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+            raise
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
         self.num_stages = len(self.stage_metadata)
@@ -468,6 +516,86 @@ class AsyncOmniEngine:
         """Async abort API."""
         self.abort(request_ids)
 
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+    ) -> list[Any]:
+        """Send a control RPC to the Orchestrator and wait for aggregated results.
+
+        This uses a dedicated RPC output queue so control-plane messages do not
+        race with the normal request output polling loop.
+        """
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        if self.rpc_output_queue is None:
+            raise RuntimeError("rpc_output_queue is not initialized")
+
+        rpc_id = uuid.uuid4().hex
+        msg = {
+            "type": "collective_rpc",
+            "rpc_id": rpc_id,
+            "method": method,
+            "args": tuple(args),
+            "kwargs": kwargs or {},
+            "stage_ids": stage_ids,
+        }
+
+        with self._rpc_lock:
+            self.request_queue.sync_q.put_nowait(msg)
+            deadline = None if timeout is None else time.monotonic() + timeout
+
+            while True:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                try:
+                    result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise TimeoutError(f"collective_rpc timed out after {timeout} seconds") from exc
+
+                if result_msg.get("type") == "error":
+                    raise RuntimeError(result_msg.get("error", "Orchestrator returned an error message"))
+
+                if result_msg.get("type") != "collective_rpc_result":
+                    logger.warning(
+                        "[AsyncOmniEngine] Dropping unexpected rpc queue message type=%s",
+                        result_msg.get("type"),
+                    )
+                    continue
+
+                if result_msg.get("rpc_id") != rpc_id:
+                    logger.warning(
+                        "[AsyncOmniEngine] Dropping mismatched rpc result rpc_id=%s expected=%s",
+                        result_msg.get("rpc_id"),
+                        rpc_id,
+                    )
+                    continue
+
+                return list(result_msg.get("results", []))
+
+    async def collective_rpc_async(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+    ) -> list[Any]:
+        """Async wrapper around collective_rpc()."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.collective_rpc(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                stage_ids=stage_ids,
+            ),
+        )
+
     def shutdown(self) -> None:
         """Send shutdown message and wait for the Orchestrator thread to exit."""
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
@@ -481,7 +609,7 @@ class AsyncOmniEngine:
             if self.orchestrator_thread.is_alive():
                 logger.warning("[AsyncOmniEngine] Orchestrator thread did not exit in time")
 
-        for q in (self.request_queue, self.output_queue):
+        for q in (self.request_queue, self.output_queue, self.rpc_output_queue):
             if q is None:
                 continue
             try:

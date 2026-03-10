@@ -10,6 +10,7 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 import base64
 import io
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -115,7 +116,10 @@ class FakeAsyncOmni:
     """Fake AsyncOmni that yields a single diffusion output."""
 
     def __init__(self):
-        self.stage_list = ["llm", "diffusion"]
+        self.stage_configs = [
+            SimpleNamespace(stage_type="llm"),
+            SimpleNamespace(stage_type="diffusion"),
+        ]
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
@@ -159,7 +163,7 @@ def test_client(mock_async_diffusion):
     # Set up app state with diffusion engine
     app.state.engine_client = mock_async_diffusion
     app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
-    app.state.stage_configs = [{"stage_type": "diffusion"}]
+    app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
     app.state.args = Namespace(
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
@@ -180,7 +184,10 @@ def async_omni_test_client():
     app.include_router(router)
 
     app.state.engine_client = FakeAsyncOmni()
-    app.state.stage_configs = [{"stage_type": "llm"}, {"stage_type": "diffusion"}]
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="diffusion"),
+    ]
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
         max_generated_image_size=4096,  # 64*64

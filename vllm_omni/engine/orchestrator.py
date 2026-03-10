@@ -181,6 +181,7 @@ class Orchestrator:
         self,
         request_async_queue: janus.AsyncQueue[dict[str, Any]],
         output_async_queue: janus.AsyncQueue[dict[str, Any]],
+        rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
         stage_clients: list[Any],
         output_processors: list[Any],
         stage_vllm_configs: list[Any],
@@ -189,6 +190,7 @@ class Orchestrator:
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
+        self.rpc_async_queue = rpc_async_queue
 
         self.num_stages = len(stage_clients)
         self.async_chunk = bool(async_chunk)
@@ -207,6 +209,7 @@ class Orchestrator:
 
         # Shutdown coordination
         self._shutdown_event = asyncio.Event()
+        self._stages_shutdown = False
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -227,6 +230,7 @@ class Orchestrator:
             logger.exception("[Orchestrator] Fatal error in orchestrator tasks")
             raise
         finally:
+            self._shutdown_event.set()
             for t in (request_task, output_task):
                 if not t.done():
                     t.cancel()
@@ -234,6 +238,8 @@ class Orchestrator:
                 await asyncio.gather(request_task, output_task, return_exceptions=True)
             except Exception:
                 pass
+
+            self._shutdown_stages()
 
             # Cancel any remaining tasks spawned by wait_for / gather so
             # the event loop can close cleanly without "pending task" errors.
@@ -254,6 +260,8 @@ class Orchestrator:
                 await self._handle_add_request(msg)
             elif msg_type == "abort":
                 await self._handle_abort(msg)
+            elif msg_type == "collective_rpc":
+                await self._handle_collective_rpc(msg)
             elif msg_type == "shutdown":
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
@@ -667,8 +675,78 @@ class Orchestrator:
             self.request_states.pop(req_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
+    async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
+        """Handle a control-plane RPC request from the main thread.
+
+        TODO(AsyncOmniV1): parallelize stage dispatch if control latency becomes
+        noticeable. The current sequential fanout keeps the first version simple
+        and deterministic.
+        """
+        rpc_id = msg["rpc_id"]
+        method = msg["method"]
+        args = tuple(msg.get("args", ()))
+        kwargs = dict(msg.get("kwargs") or {})
+        requested_stage_ids = msg.get("stage_ids")
+        stage_ids = list(range(self.num_stages)) if requested_stage_ids is None else list(requested_stage_ids)
+
+        results: list[Any] = []
+        for stage_id in stage_ids:
+            if stage_id < 0 or stage_id >= self.num_stages:
+                results.append(
+                    {
+                        "supported": False,
+                        "todo": True,
+                        "error": f"Invalid stage id {stage_id}",
+                    }
+                )
+                continue
+
+            stage_client = self.stage_clients[stage_id]
+            try:
+                if hasattr(stage_client, "collective_rpc_async"):
+                    stage_result = await stage_client.collective_rpc_async(
+                        method=method,
+                        args=args,
+                        kwargs=kwargs,
+                    )
+                else:
+                    stage_result = {
+                        "supported": False,
+                        "todo": True,
+                        "reason": (
+                            f"{stage_client.__class__.__name__}.collective_rpc_async "
+                            "is not implemented yet"
+                        ),
+                    }
+            except Exception as exc:
+                logger.exception(
+                    "[Orchestrator] collective_rpc failed: stage=%s method=%s",
+                    stage_id,
+                    method,
+                )
+                stage_result = {
+                    "supported": False,
+                    "error": str(exc),
+                }
+
+            results.append(stage_result)
+
+        await self.rpc_async_queue.put(
+            {
+                "type": "collective_rpc_result",
+                "rpc_id": rpc_id,
+                "method": method,
+                "stage_ids": stage_ids,
+                "results": results,
+            }
+        )
+
     def _shutdown_stages(self) -> None:
         """Shutdown all stage clients."""
+        if self._stages_shutdown:
+            return
+
+        self._stages_shutdown = True
         logger.info("[Orchestrator] Shutting down all stages")
         for stage_id, stage_client in enumerate(self.stage_clients):
             try:

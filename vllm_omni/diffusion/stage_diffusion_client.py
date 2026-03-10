@@ -7,7 +7,7 @@ expects from any stage client.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -93,6 +93,47 @@ class StageDiffusionClient:
             task = self._tasks.pop(rid, None)
             if task:
                 task.cancel()
+
+    async def collective_rpc_async(
+        self,
+        method: str,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Best-effort control RPC shim for diffusion stages.
+
+        TODO(AsyncOmniV1): add dedicated wrappers on AsyncOmniDiffusion for the
+        remaining control APIs instead of reaching into its underlying engine.
+        """
+        kwargs = kwargs or {}
+
+        if method in {"add_lora", "remove_lora", "list_loras", "pin_lora", "start_profile", "stop_profile"}:
+            target = getattr(self._engine, method, None)
+            if target is None:
+                return {
+                    "supported": False,
+                    "todo": True,
+                    "reason": f"AsyncOmniDiffusion.{method} is not implemented",
+                }
+            return await target(*args, **kwargs)
+
+        if method in {"sleep", "wake_up"}:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self._engine._executor,
+                self._engine.engine.collective_rpc,
+                method,
+                None,
+                args,
+                kwargs,
+                None,
+            )
+
+        return {
+            "supported": False,
+            "todo": True,
+            "reason": f"Diffusion stage collective_rpc method {method} is not implemented yet",
+        }
 
     def shutdown(self) -> None:
         for task in self._tasks.values():

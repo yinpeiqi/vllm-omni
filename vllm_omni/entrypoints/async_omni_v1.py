@@ -95,6 +95,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         )
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
+        self._is_sleeping: bool = False
         self.final_output_task: asyncio.Task | None = None
 
         self.config_path = self.engine.config_path
@@ -336,6 +337,54 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
     # ==================== Control Methods ====================
 
+    async def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+    ) -> list[Any]:
+        """Execute a best-effort control RPC on selected stages.
+
+        Unsupported stages currently return a TODO-style result dict instead of
+        failing the entire call. This keeps V1 usable while the orchestrator
+        control plane is still being filled out.
+        """
+        results = await self.engine.collective_rpc_async(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            stage_ids=stage_ids,
+        )
+
+        unsupported_stage_ids: list[int] = []
+        effective_stage_ids = stage_ids or list(range(len(results)))
+        for index, result in enumerate(results):
+            if isinstance(result, dict) and result.get("todo"):
+                unsupported_stage_ids.append(effective_stage_ids[index])
+
+        if unsupported_stage_ids:
+            logger.warning(
+                "[AsyncOmniV1] collective_rpc(%s) has TODO support on stage(s): %s",
+                method,
+                unsupported_stage_ids,
+            )
+
+        return results
+
+    @staticmethod
+    def _coerce_stage_bool(result: Any) -> bool:
+        """Reduce a stage RPC result to a boolean.
+
+        V0-style stage RPCs may return worker-level lists like ``[True]``;
+        diffusion wrappers usually return a plain bool.
+        """
+        if isinstance(result, list):
+            return all(bool(item) for item in result)
+        return bool(result)
+
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort request(s) via the Orchestrator."""
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
@@ -379,19 +428,19 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(self, stages: list[int] | None = None) -> None:
+    async def start_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Start profiling specified stages.
 
-        TODO: Forward to Orchestrator process via message.
+        TODO(AsyncOmniV1): normalize return payloads across LLM/diffusion stages.
         """
-        logger.warning("[AsyncOmniV1] start_profile not yet supported with Orchestrator process (stages=%s)", stages)
+        return await self.collective_rpc(method="start_profile", stage_ids=stages)
 
-    async def stop_profile(self, stages: list[int] | None = None) -> None:
+    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.
 
-        TODO: Forward to Orchestrator process via message.
+        TODO(AsyncOmniV1): normalize return payloads across LLM/diffusion stages.
         """
-        logger.warning("[AsyncOmniV1] stop_profile not yet supported with Orchestrator process (stages=%s)", stages)
+        return await self.collective_rpc(method="stop_profile", stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache for all stages.
@@ -422,31 +471,61 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
     async def sleep(self, level: int = 1) -> None:
         """Sleep all stages.
 
-        TODO: Forward to Orchestrator process via message.
+        Best-effort: unsupported stages will emit a TODO result.
         """
-        logger.warning("[AsyncOmniV1] sleep not yet supported with Orchestrator process")
+        self._is_sleeping = True
+        await self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
         """Wake up all stages.
 
-        TODO: Forward to Orchestrator process via message.
+        Best-effort: unsupported stages will emit a TODO result.
         """
-        logger.warning("[AsyncOmniV1] wake_up not yet supported with Orchestrator process")
+        self._is_sleeping = False
+        await self.collective_rpc(method="wake_up", args=(tags,))
 
     async def is_sleeping(self) -> bool:
         """Return whether all stages are sleeping.
 
-        TODO: Forward to Orchestrator process via message.
+        TODO(AsyncOmniV1): query the orchestrator once all stage backends expose
+        a real sleeping-state RPC. For now we track the requested state locally.
         """
-        return False
+        return self._is_sleeping
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into all stages.
 
-        TODO: Forward to Orchestrator process via message.
+        Returns True only if all concretely-implemented stages report success.
         """
-        logger.warning("[AsyncOmniV1] add_lora not yet supported with Orchestrator process")
-        return False
+        results = await self.collective_rpc(method="add_lora", args=(lora_request,))
+        concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
+        return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
+
+    async def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA adapter from all stages.
+
+        TODO(AsyncOmniV1): add richer per-stage error reporting to the public API.
+        """
+        results = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
+        concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
+        return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
+
+    async def list_loras(self) -> list[int]:
+        """List all loaded LoRA adapter IDs across stages."""
+        results = await self.collective_rpc(method="list_loras")
+        merged: set[int] = set()
+        for result in results:
+            if isinstance(result, dict) and result.get("todo"):
+                continue
+            if isinstance(result, list):
+                merged.update(result)
+        return sorted(merged)
+
+    async def pin_lora(self, adapter_id: int) -> bool:
+        """Pin a LoRA adapter across stages."""
+        results = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
+        concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
+        return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
 
     # ==================== Properties ====================
 
