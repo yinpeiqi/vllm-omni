@@ -97,6 +97,7 @@ class StageDiffusionClient:
     async def collective_rpc_async(
         self,
         method: str,
+        timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
@@ -115,7 +116,10 @@ class StageDiffusionClient:
                     "todo": True,
                     "reason": f"AsyncOmniDiffusion.{method} is not implemented",
                 }
-            return await target(*args, **kwargs)
+            result = target(*args, **kwargs)
+            if timeout is not None:
+                return await asyncio.wait_for(result, timeout=timeout)
+            return await result
 
         if method in {"sleep", "wake_up"}:
             loop = asyncio.get_running_loop()
@@ -123,7 +127,7 @@ class StageDiffusionClient:
                 self._engine._executor,
                 self._engine.engine.collective_rpc,
                 method,
-                None,
+                timeout,
                 args,
                 kwargs,
                 None,

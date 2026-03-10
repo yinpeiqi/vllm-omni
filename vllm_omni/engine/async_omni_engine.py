@@ -64,11 +64,11 @@ class AsyncOmniEngine:
         """Initialize stage clients/processors in orchestrator thread and assign to self."""
         from vllm.tokenizers import cached_tokenizer_from_config
 
+        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
         from vllm_omni.distributed.omni_connectors import (
             get_stage_connector_config,
             load_omni_transfer_config,
         )
-        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
         from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
         from vllm_omni.engine.stage_init import (
             acquire_device_locks,
@@ -363,14 +363,11 @@ class AsyncOmniEngine:
     ) -> dict[str, Any]:
         """Build an add_request message after stage-0 preprocessing."""
         effective_sampling_params_list = (
-            list(sampling_params_list)
-            if sampling_params_list is not None
-            else list(self.default_sampling_params_list)
+            list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
         )
         if not effective_sampling_params_list:
             raise ValueError(
-                "Missing sampling params for stage 0. "
-                f"Got {len(effective_sampling_params_list)} stage params."
+                f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
         params = effective_sampling_params_list[0]
 

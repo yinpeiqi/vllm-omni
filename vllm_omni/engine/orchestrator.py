@@ -559,10 +559,7 @@ class Orchestrator:
         original_prompt = msg.get("original_prompt", prompt)
         sampling_params_list = msg["sampling_params_list"]
         if not sampling_params_list:
-            raise ValueError(
-                "Missing sampling params for stage 0. "
-                f"Got {len(sampling_params_list)} stage params."
-            )
+            raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         params = sampling_params_list[0]
         final_stage_id = msg["final_stage_id"]
 
@@ -684,6 +681,7 @@ class Orchestrator:
         """
         rpc_id = msg["rpc_id"]
         method = msg["method"]
+        timeout = msg.get("timeout")
         args = tuple(msg.get("args", ()))
         kwargs = dict(msg.get("kwargs") or {})
         requested_stage_ids = msg.get("stage_ids")
@@ -706,6 +704,7 @@ class Orchestrator:
                 if hasattr(stage_client, "collective_rpc_async"):
                     stage_result = await stage_client.collective_rpc_async(
                         method=method,
+                        timeout=timeout,
                         args=args,
                         kwargs=kwargs,
                     )
@@ -713,10 +712,7 @@ class Orchestrator:
                     stage_result = {
                         "supported": False,
                         "todo": True,
-                        "reason": (
-                            f"{stage_client.__class__.__name__}.collective_rpc_async "
-                            "is not implemented yet"
-                        ),
+                        "reason": (f"{stage_client.__class__.__name__}.collective_rpc_async is not implemented yet"),
                     }
             except Exception as exc:
                 logger.exception(

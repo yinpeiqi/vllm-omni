@@ -6,7 +6,6 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
-import inspect
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -139,25 +138,19 @@ class StageEngineCoreClient(AsyncMPClient):
     async def collective_rpc_async(
         self,
         method: str,
+        timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Best-effort control RPC shim for vLLM EngineCore stages.
+        """Forward control RPCs to the underlying AsyncMPClient stage engine.
 
-        TODO(AsyncOmniV1): expose a first-class EngineCore control channel for
-        methods not surfaced by upstream AsyncMPClient. For now we only invoke
-        methods that already exist on the client object.
+        Each ``StageEngineCoreClient`` already represents one logical stage, so
+        stage-scoped control operations should be executed here and then fanned
+        in-core across the workers managed by this EngineCore client.
         """
-        kwargs = kwargs or {}
-        target = getattr(self, method, None)
-        if target is None:
-            return {
-                "supported": False,
-                "todo": True,
-                "reason": f"{self.__class__.__name__}.{method} is not exposed by AsyncMPClient",
-            }
-
-        result = target(*args, **kwargs)
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        return await super().collective_rpc_async(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+        )

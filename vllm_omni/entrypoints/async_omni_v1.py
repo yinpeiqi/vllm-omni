@@ -23,6 +23,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_v1_base import (
     OmniV1Base,
+)
+from vllm_omni.entrypoints.omni_v1_base import (
     omni_snapshot_download as _omni_snapshot_download,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics

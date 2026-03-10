@@ -118,7 +118,9 @@ def get_image_query(question: str | None = None, image_path: str | None = None) 
     )
 
 
-def get_audio_query(question: str | None = None, audio_path: str | None = None, sampling_rate: int = 16000) -> QueryResult:
+def get_audio_query(
+    question: str | None = None, audio_path: str | None = None, sampling_rate: int = 16000
+) -> QueryResult:
     if question is None:
         question = "What is the content of this audio?"
     prompt = (

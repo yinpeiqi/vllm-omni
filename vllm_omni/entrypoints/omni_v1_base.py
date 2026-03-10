@@ -49,10 +49,7 @@ def omni_snapshot_download(model_id: str) -> str:
     return model_id
 
 
-OutputMessageHandleResult = (
-    tuple[Literal[True], None, None, None]
-    | tuple[Literal[False], str, int, ClientRequestState]
-)
+OutputMessageHandleResult = tuple[Literal[True], None, None, None] | tuple[Literal[False], str, int, ClientRequestState]
 
 
 class OmniV1Base:
@@ -132,13 +129,9 @@ class OmniV1Base:
         elif self.num_stages == 1:
             normalized = [sampling_params_list]
         else:
-            raise ValueError(
-                f"Expected {self.num_stages} sampling params, got a single sampling params object"
-            )
+            raise ValueError(f"Expected {self.num_stages} sampling params, got a single sampling params object")
         if len(normalized) != self.num_stages:
-            raise ValueError(
-                f"Expected {self.num_stages} sampling params, got {len(normalized)}"
-            )
+            raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
         return normalized
 
     def _log_summary_and_cleanup(self, request_id: str) -> None:

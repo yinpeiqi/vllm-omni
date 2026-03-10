@@ -1291,9 +1291,7 @@ async def _generate_with_async_omni(
 ):
     engine_client = cast(AsyncOmni, engine_client)
     result = None
-    default_params_list: list[OmniSamplingParams] | None = getattr(
-        engine_client, "default_sampling_params_list", None
-    )
+    default_params_list: list[OmniSamplingParams] | None = getattr(engine_client, "default_sampling_params_list", None)
     if not isinstance(default_params_list, list):
         default_params_list = [
             OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types

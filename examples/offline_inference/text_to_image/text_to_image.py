@@ -16,6 +16,13 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.platforms import current_omni_platform
 
+USE_V1 = (os.environ.get("vllm_omni_use_v1") or os.environ.get("VLLM_OMNI_USE_V1", "")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 
 def is_nextstep_model(model_name: str) -> bool:
     """Check if the model is a NextStep model by reading its config."""
