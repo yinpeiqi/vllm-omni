@@ -385,6 +385,12 @@ class AsyncOmniEngine:
         self.output_processors = output_processors
         self.stage_vllm_configs = stage_vllm_configs
         self.input_processor = input_processor
+        supported_tasks = ("generate",)
+        if initialized_stage_clients and hasattr(initialized_stage_clients[0], "get_supported_tasks"):
+            supported_tasks = tuple(initialized_stage_clients[0].get_supported_tasks())
+            if not supported_tasks:
+                supported_tasks = ("generate",)
+        self.supported_tasks = supported_tasks
         self.default_sampling_params_list = default_sampling_params_list
         self.stage_metadata = stage_metadata
         self.num_stages = len(stage_metadata)
@@ -494,6 +500,7 @@ class AsyncOmniEngine:
         self.stage_vllm_configs: list[Any] = []
         self.output_processors: list[MultimodalOutputProcessor | None] = []
         self.input_processor: InputProcessor | None = None
+        self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[Any] = []
         self.stage_metadata: list[dict[str, Any]] = []
         self.request_queue: janus.Queue[dict[str, Any]] | None = None
@@ -576,6 +583,7 @@ class AsyncOmniEngine:
                 request_id=request_id,
                 prompt=prompt,
                 params=params,
+                supported_tasks=self.supported_tasks,
                 arrival_time=arrival_time,
             )
             # Restore external_req_id to the original user-facing request_id.
