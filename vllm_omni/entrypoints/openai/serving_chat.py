@@ -14,7 +14,7 @@ from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
 
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
@@ -626,10 +626,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return final_sampling_params_list
 
     def _get_comprehension_stage_index(self) -> int:
-        for idx, stage in enumerate(self.engine_client.stage_list):
+        for idx, stage in enumerate(self.engine_client.stage_configs):
             if stage.is_comprehension:
                 return idx
-        raise ValueError("No comprehension stage (is_comprehension=True) found in stage_list")
+        raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -2152,8 +2152,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Generate image
             # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
-            if hasattr(self._diffusion_engine, "stage_list"):
-                # AsyncOmni: iterate through async generator to get final output
+            if isinstance(self._diffusion_engine, AsyncOmni):
                 diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
                 result = None
                 async for output in diffusion_engine.generate(
