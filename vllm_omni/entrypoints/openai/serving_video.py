@@ -171,9 +171,11 @@ class OmniOpenAIServingVideo:
             return self._model_name
         if raw_request is None:
             return None
-        base_paths = raw_request.app.state.openai_serving_models.base_model_paths
-        if base_paths:
-            return base_paths[0].name
+        serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
+        if serving_models and getattr(serving_models, "base_model_paths", None):
+            base_paths = serving_models.base_model_paths
+            if base_paths:
+                return base_paths[0].name
         return None
 
     @staticmethod
