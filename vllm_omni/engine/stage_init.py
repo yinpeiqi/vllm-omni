@@ -20,6 +20,7 @@ from typing import Any, Literal
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
 from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -46,6 +47,19 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+
+
+@dataclass
+class StartedLlmStage:
+    """Resources for an LLM stage that has completed startup."""
+
+    stage_id: int
+    metadata: Any
+    vllm_config: Any
+    executor_class: type
+    engine_manager: Any
+    coordinator: Any
+    addresses: Any
 
 
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
@@ -298,3 +312,118 @@ def release_device_locks(lock_fds: list[int]) -> None:
             logger.debug("Released initialization lock (fd=%s)", lock_fd)
         except (OSError, ValueError):
             pass
+
+
+
+def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
+    """Load omni transfer config from an explicit path or resolved model config."""
+    from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
+    from vllm_omni.entrypoints.utils import resolve_model_config_path
+
+    try:
+        resolved_config_path = config_path or resolve_model_config_path(model)
+        return load_omni_transfer_config(resolved_config_path)
+    except Exception as e:
+        logger.warning("[stage_init] Failed to load transfer config: %s", e)
+        return None
+
+
+def get_stage_connector_spec(
+    omni_transfer_config: Any,
+    stage_id: int,
+    async_chunk: bool,
+) -> dict[str, Any]:
+    """Return the first connector spec for the stage when async chunking is enabled."""
+    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+
+    if not async_chunk:
+        return {}
+
+    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
+    for cfg in stage_connectors_cfg.values():
+        return dict(cfg.get("spec", {}))
+    return {}
+
+
+def initialize_diffusion_stage(model: str, stage_cfg: Any, metadata: StageMetadata) -> Any:
+    """Build a diffusion stage client."""
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+
+    od_config = OmniDiffusionConfig.from_kwargs(
+        model=model,
+        **_to_dict(stage_cfg.engine_args),
+    )
+    return StageDiffusionClient(model, od_config, metadata)
+
+
+def close_started_llm_stage(started: StartedLlmStage) -> None:
+    """Close managers owned by a launched stage that never attached."""
+    resources = (
+        ("engine manager", started.engine_manager),
+        ("coordinator", started.coordinator),
+    )
+    for resource_name, resource in resources:
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to close launched %s for stage %s: %s",
+                resource_name,
+                started.stage_id,
+                cleanup_error,
+            )
+
+
+def finalize_initialized_stages(
+    stage_clients: list[Any | None],
+    input_processor: InputProcessor | None,
+) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
+    """Validate successful init and build runtime metadata lists."""
+    if any(stage_client is None for stage_client in stage_clients):
+        raise RuntimeError("Stage initialization completed with missing stage clients")
+
+    initialized_stage_clients = [stage_client for stage_client in stage_clients if stage_client is not None]
+    default_sampling_params_list = [
+        stage_client.default_sampling_params for stage_client in initialized_stage_clients
+    ]
+    stage_metadata = [
+        {
+            "final_output": stage_client.final_output,
+            "final_output_type": stage_client.final_output_type,
+            "stage_type": stage_client.stage_type,
+        }
+        for stage_client in initialized_stage_clients
+    ]
+
+    if not isinstance(input_processor, InputProcessor):
+        has_llm_stage = any(metadata.get("stage_type") != "diffusion" for metadata in stage_metadata)
+        if has_llm_stage:
+            raise RuntimeError("Failed to initialize stage-0 InputProcessor for LLM pipeline")
+
+    return initialized_stage_clients, default_sampling_params_list, stage_metadata
+
+
+def cleanup_failed_stage_initialization(
+    stage_clients: list[Any | None],
+    started_llm_stages: list[StartedLlmStage],
+) -> None:
+    """Shutdown attached stages and close any launched-but-unattached engines."""
+    for cleanup_stage_id, stage_client in reversed(list(enumerate(stage_clients))):
+        if stage_client is None:
+            continue
+        try:
+            stage_client.shutdown()
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to shutdown initialized stage %s after init failure: %s",
+                cleanup_stage_id,
+                cleanup_error,
+            )
+
+    for started in reversed(started_llm_stages):
+        if stage_clients[started.stage_id] is not None:
+            continue
+        close_started_llm_stage(started)

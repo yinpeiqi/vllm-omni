@@ -28,7 +28,6 @@ from vllm_omni.engine import (
     AdditionalInformationEntry,
     AdditionalInformationPayload,
     OmniEngineCoreRequest,
-    PromptEmbedsPayload,
 )
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
@@ -96,17 +95,7 @@ def build_engine_core_request_from_tokens(
     else:
         pooling_params = params.clone()
 
-    # TODO: payload are parsed with the request by now. But will move to connector later.
-    # Serialize prompt_embeds if present
-    prompt_embeds_payload: PromptEmbedsPayload | None = None
-    pe: torch.Tensor | None = prompt.get("prompt_embeds")
-    if pe is not None:
-        pe_cpu = pe.detach().to("cpu").contiguous()
-        prompt_embeds_payload = PromptEmbedsPayload(
-            data=pe_cpu.numpy().tobytes(),
-            shape=list(pe_cpu.shape),
-            dtype=_dtype_to_name(pe_cpu.dtype),
-        )
+    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
 
     # Serialize additional_information if present
     additional_info_payload: AdditionalInformationPayload | None = None
@@ -132,22 +121,17 @@ def build_engine_core_request_from_tokens(
                 )
         additional_info_payload = AdditionalInformationPayload(entries=entries)
 
-    eos_token_id = None
-    if model_config is not None and hasattr(model_config, "hf_config"):
-        eos_token_id = getattr(model_config.hf_config, "eos_token_id", None)
-
     return OmniEngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=None,
         sampling_params=sampling_params,
         pooling_params=pooling_params,
-        eos_token_id=eos_token_id,
         arrival_time=arrival_time,
         lora_request=None,
         cache_salt=None,
         data_parallel_rank=None,
-        prompt_embeds=prompt_embeds_payload,
+        prompt_embeds=prompt_embeds,
         additional_information=additional_info_payload,
     )
 
