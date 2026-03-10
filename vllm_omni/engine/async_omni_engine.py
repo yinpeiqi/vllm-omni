@@ -123,7 +123,7 @@ class AsyncOmniEngine:
         stage_init_timeout: int,
     ) -> _PendingLlmStageLaunch:
         """Start stage engine processes early but defer client attachment."""
-        from vllm.v1.engine.utils import launch_core_engines
+        from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
         from vllm_omni.engine.stage_init import (
             acquire_device_locks,
@@ -141,10 +141,12 @@ class AsyncOmniEngine:
         engine_args_dict["model"] = self.model
         lock_fds = acquire_device_locks(metadata.stage_id, engine_args_dict, stage_init_timeout)
         try:
+            addresses = get_engine_zmq_addresses(vllm_config)
             launch_cm = launch_core_engines(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 log_stats=False,
+                addresses=addresses,
             )
             engine_manager, coordinator, addresses = launch_cm.__enter__()
         except Exception:
