@@ -57,6 +57,7 @@ class AsyncOmni(EngineClient, OmniBase):
         model: Model name or path to load.
         stage_configs: Optional list of stage configurations. If None, loads from model.
         stage_configs_path: Optional path to YAML file containing stage configurations.
+        init_timeout: Total timeout for orchestrator startup (seconds).
         stage_init_timeout: Timeout for stage initialization (seconds).
         log_stats: Whether to enable statistics logging.
         async_chunk: Whether to use async chunk mode (parallel stage execution).
@@ -79,6 +80,7 @@ class AsyncOmni(EngineClient, OmniBase):
         stage_configs: list[Any] | None = None,
         stage_configs_path: str | None = None,
         stage_init_timeout: int = 300,
+        init_timeout: int = 300,
         log_stats: bool = False,
         async_chunk: bool = False,
         output_modalities: list[str] | None = None,
@@ -89,6 +91,7 @@ class AsyncOmni(EngineClient, OmniBase):
             model=model,
             stage_configs=stage_configs,
             stage_configs_path=stage_configs_path,
+            init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             log_stats=log_stats,
             async_chunk=async_chunk,

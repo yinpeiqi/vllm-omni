@@ -14,7 +14,7 @@ from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
 
-from vllm_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
