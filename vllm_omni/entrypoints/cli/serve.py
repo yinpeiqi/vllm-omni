@@ -382,25 +382,8 @@ def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[s
 
 
 def run_headless(args: argparse.Namespace) -> None:
-    """Run a single stage in headless mode (DEPRECATED).
+    """Run a single stage in headless mode."""
 
-    .. deprecated:: 0.x.x
-        Headless mode is deprecated and will be removed in a future version.
-        It is only compatible with V0 architecture (OmniStage-based).
-        V1 architecture (AsyncOmniEngine-based) does not support headless mode.
-
-    Raises:
-        RuntimeError: Always raises an error indicating headless mode is deprecated.
-    """
-    raise RuntimeError(
-        "Headless mode is deprecated and not supported in V1 architecture. "
-        "Please use the standard orchestrator mode (without --headless flag). "
-        "If you need distributed deployment, consider using Ray backend or "
-        "other distributed serving solutions."
-    )
-
-    # ===== DEPRECATED CODE BELOW (kept for reference) =====
-    # The following code is no longer executed but kept for historical reference.
     if args.api_server_count is not None and args.api_server_count > 1:
         raise ValueError("api_server_count can't be set in headless mode")
     if args.worker_backend != "multi_process":
