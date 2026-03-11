@@ -365,22 +365,120 @@ def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[s
 
 
 def run_headless(args: argparse.Namespace) -> None:
-    """Run a single stage in headless mode (DEPRECATED).
+    """Run a single stage in headless mode."""
 
-    .. deprecated:: 0.x.x
-        Headless mode is deprecated and will be removed in a future version.
-        It is only compatible with V0 architecture (OmniStage-based).
-        V1 architecture (AsyncOmniEngine-based) does not support headless mode.
+    if args.api_server_count is not None and args.api_server_count > 1:
+        raise ValueError("api_server_count can't be set in headless mode")
+    if args.worker_backend != "multi_process":
+        raise ValueError("headless mode requires worker_backend=multi_process")
 
-    Raises:
-        RuntimeError: Always raises an error indicating headless mode is deprecated.
-    """
-    raise RuntimeError(
-        "Headless mode is deprecated and not supported in V1 architecture. "
-        "Please use the standard orchestrator mode (without --headless flag). "
-        "If you need distributed deployment, consider using Ray backend or "
-        "other distributed serving solutions."
-    )
+    model = omni_snapshot_download(args.model)
+
+    omni_base = OmniBase.__new__(OmniBase)
+    args_dict = vars(args).copy()
+    args_dict["model"] = model
+    config_path, stage_configs = omni_base._resolve_stage_configs(model, args_dict)
+
+    single_stage_id = args.stage_id
+    if single_stage_id is None:
+        if len(stage_configs) != 1:
+            raise ValueError("--stage-id is required in headless mode for multi-stage configs")
+        single_stage_id = getattr(stage_configs[0], "stage_id", 0)
+
+    stage_config = None
+    for cfg in stage_configs:
+        if getattr(cfg, "stage_id", None) == single_stage_id:
+            stage_config = cfg
+            break
+    if stage_config is None:
+        raise ValueError(f"No stage matches stage_id={single_stage_id}.")
+
+    # TODO(wuhang): Support connectors config by cli
+    transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=args.shm_threshold_bytes)
+    connectors_config = get_connectors_config_for_stage(transfer_config, single_stage_id)
+
+    omni_master_address = args.omni_master_address
+    omni_master_port = args.omni_master_port
+
+    # Perform handshake with orchestrator to get dynamically allocated endpoints
+    with zmq.Context() as zmq_ctx:
+        handshake_endpoint = get_engine_client_zmq_addr(
+            local_only=False, host=omni_master_address, port=omni_master_port
+        )
+
+        with make_zmq_socket(zmq_ctx, handshake_endpoint, zmq.REQ, bind=False, linger=5000) as handshake_socket:
+            # TODO(wuhang): Define protocol in python dataclass.
+            handshake_msg = {"type": "handshake", "stage_id": single_stage_id}
+            handshake_socket.send(msgspec.msgpack.encode(handshake_msg))
+
+            # Wait for response with timeout
+            if not handshake_socket.poll(timeout=HANDSHAKE_TIMEOUT_MINS * 60_000):
+                raise RuntimeError(
+                    f"Handshake timeout ({HANDSHAKE_TIMEOUT_MINS} minutes) for stage-{single_stage_id} "
+                    f"at {handshake_endpoint}"
+                )
+
+            try:
+                response = msgspec.msgpack.decode(handshake_socket.recv())
+            except msgspec.DecodeError as exc:
+                raise RuntimeError(
+                    f"Handshake decode failed for stage-{single_stage_id} at {handshake_endpoint}: {exc}"
+                ) from exc
+            except Exception as exc:  # pragma: no cover - unexpected decode errors
+                raise RuntimeError(
+                    f"Unexpected error decoding handshake for stage-{single_stage_id} at {handshake_endpoint}: {exc}"
+                ) from exc
+
+            if not response["ok"]:
+                error_msg = response["error"]
+                raise RuntimeError(f"Handshake failed for stage-{single_stage_id}: {error_msg}")
+
+            in_endpoint, out_endpoint = response["in_endpoint"], response["out_endpoint"]
+
+            logger.info(
+                f"[Headless] Stage-{single_stage_id} received endpoints via handshake: "
+                f"in={in_endpoint}, out={out_endpoint}"
+            )
+
+    shutdown_requested = False
+
+    def signal_handler(signum, frame):
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        raise SystemExit
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    stage = OmniStage(stage_config, stage_init_timeout=args.stage_init_timeout)
+    stage.attach_queues(in_endpoint, out_endpoint)
+
+    # Inject YAML-resolved connector config into omni_kv_config for in-engine usage.
+    try:
+        omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(transfer_config, single_stage_id)
+        if omni_conn_cfg:
+            inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
+    except Exception as e:
+        logger.debug("[Headless] Failed to inject omni connector config into stage-%s: %s", single_stage_id, e)
+
+    old_env = os.environ.get("VLLM_LOGGING_PREFIX")
+    os.environ["VLLM_LOGGING_PREFIX"] = f"[Stage-{single_stage_id}] {'' if old_env is None else old_env}"
+    try:
+        stage.init_stage_worker(
+            model,
+            is_async=True,
+            shm_threshold_bytes=int(args.shm_threshold_bytes),
+            batch_timeout=int(args.batch_timeout),
+            connectors_config=connectors_config,
+            worker_backend="multi_process",
+            ignore_runtime_config=True,
+        )
+        if stage._proc is not None:
+            stage._proc.join()
+    finally:
+        stage.stop_stage_worker()
 
 
 def cmd_init() -> list[CLISubcommand]:
