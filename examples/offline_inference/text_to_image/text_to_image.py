@@ -9,19 +9,12 @@ from typing import Any
 
 import torch
 
-from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.platforms import current_omni_platform
-
-USE_V1 = (os.environ.get("vllm_omni_use_v1") or os.environ.get("VLLM_OMNI_USE_V1", "")).lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
 
 def is_nextstep_model(model_name: str) -> bool:
@@ -311,8 +304,6 @@ def main():
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
-    if USE_V1:
-        omni_kwargs["log_stats"] = False
     omni = Omni(**omni_kwargs)
 
     if profiler_enabled:

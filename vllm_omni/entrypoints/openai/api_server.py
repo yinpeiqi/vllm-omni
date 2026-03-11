@@ -82,7 +82,7 @@ from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
-from vllm_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,

@@ -30,7 +30,7 @@ import pytest
 from PIL import Image
 
 from tests.utils import hardware_test
-from vllm_omni import Omni
+from vllm_omni.entrypoints.omni import Omni
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values

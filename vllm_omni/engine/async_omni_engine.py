@@ -20,8 +20,8 @@ from collections.abc import Sequence
 from typing import Any
 
 import janus
-from omegaconf import OmegaConf
 import torch
+from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -109,6 +109,7 @@ class AsyncOmniEngine:
         model: Model name or path
         stage_configs: List of stage configurations. If None, loads from model.
         stage_configs_path: Path to YAML file with stage configs.
+        init_timeout: Total timeout waiting for orchestrator startup (seconds).
         stage_init_timeout: Timeout for stage initialization (seconds)
         **kwargs: Additional arguments
     """
@@ -409,9 +410,11 @@ class AsyncOmniEngine:
         stage_configs: list[Any] | None = None,
         stage_configs_path: str | None = None,
         stage_init_timeout: int = 300,
+        init_timeout: int = 300,
         **kwargs: Any,
     ) -> None:
         self.model = model
+        startup_timeout = int(init_timeout)
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -475,13 +478,13 @@ class AsyncOmniEngine:
 
         # Wait for stage/runtime initialization result from orchestrator thread.
         try:
-            startup_future.result(timeout=stage_init_timeout)
+            startup_future.result(timeout=startup_timeout)
         except concurrent.futures.TimeoutError as e:
             try:
                 self.shutdown()
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
-            raise TimeoutError(f"Orchestrator did not become ready within {stage_init_timeout}s") from e
+            raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s") from e
         except Exception:
             try:
                 self.shutdown()
