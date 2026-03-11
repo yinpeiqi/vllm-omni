@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import queue
 import threading
@@ -19,6 +20,7 @@ from typing import Any
 
 import janus
 from omegaconf import OmegaConf
+import torch
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -395,7 +397,10 @@ class AsyncOmniEngine:
                 resolved_configs = OmegaConf.create(resolved_configs)
         elif stage_configs_path is None:
             self.config_path = resolve_model_config_path(model)
-            resolved_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
+            resolved_configs = load_stage_configs_from_model(
+                config_path=self.config_path,
+                base_engine_args=base_engine_args,
+            )
             if not resolved_configs:
                 default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
                 resolved_configs = OmegaConf.create(default_stage_cfg)
@@ -525,17 +530,78 @@ class AsyncOmniEngine:
         }
 
     @staticmethod
+    def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
+        if cache_backend == "cache_dit":
+            return {
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+                "enable_taylorseer": False,
+                "taylorseer_order": 1,
+                "scm_steps_mask_policy": None,
+                "scm_steps_policy": "dynamic",
+            }
+        if cache_backend == "tea_cache":
+            return {
+                "rel_l1_thresh": 0.2,
+            }
+        return None
+
+    @staticmethod
+    def _normalize_cache_config(cache_backend: str | None, cache_config: Any | None) -> Any | None:
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid cache_config JSON, using defaults.")
+                cache_config = None
+        if cache_config is None and cache_backend not in (None, "", "none"):
+            cache_config = AsyncOmniEngine._get_default_cache_config(cache_backend)
+        return cache_config
+
+    @staticmethod
     def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list:
         """Create a default single-stage diffusion config from kwargs."""
-        return [
+        # We temporally create a default config for diffusion stage.
+        # In the future, we should merge the default config with the user-provided config.
+        # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
+        if "dtype" in kwargs and not isinstance(kwargs["dtype"], str):
+            if not isinstance(kwargs["dtype"], torch.dtype):
+                raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(kwargs['dtype']).__name__}")
+            kwargs["dtype"] = str(kwargs["dtype"]).removeprefix("torch.")
+
+        cache_backend = kwargs.get("cache_backend", "none")
+        cache_config = AsyncOmniEngine._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+        # TODO: hack, calculate devices based on parallel config.
+        devices = "0"
+        if "parallel_config" in kwargs:
+            num_devices = kwargs["parallel_config"].world_size
+            for i in range(1, num_devices):
+                devices += f",{i}"
+        default_stage_cfg = [
             {
                 "stage_id": 0,
                 "stage_type": "diffusion",
-                "engine_args": kwargs,
+                "runtime": {
+                    "process": True,
+                    "devices": devices,
+                    "max_batch_size": 1,
+                },
+                "engine_args": OmegaConf.create(
+                    {
+                        **kwargs,
+                        "cache_backend": cache_backend,
+                        "cache_config": cache_config,
+                    }
+                ),
                 "final_output": True,
                 "final_output_type": "image",
             }
         ]
+        default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
+        return default_stage_cfg
 
     # ==================== Public API ====================
 
