@@ -6,19 +6,14 @@ Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
-- [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
 - [vllm_omni.entrypoints.client_request_state.ClientRequestState][]
 - [vllm_omni.entrypoints.omni.Omni][]
-- [vllm_omni.entrypoints.omni.OmniBase][]
-- [vllm_omni.entrypoints.omni_diffusion.OmniDiffusion][]
-- [vllm_omni.entrypoints.omni_llm.OmniLLM][]
-- [vllm_omni.entrypoints.omni_stage.OmniStage][]
+- [vllm_omni.entrypoints.omni_base.OmniBase][]
 - [vllm_omni.entrypoints.stage_utils.OmniStageTaskType][]
-- [vllm_omni.entrypoints.zmq_utils.ZmqQueue][]
 
 ## Inputs
 

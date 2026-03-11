@@ -1,4 +1,4 @@
-﻿# AsyncOmni V1 Architecture (Qwen3-Omni Example)
+﻿# AsyncOmni Architecture (Qwen3-Omni Example)
 
 ## 1. System Architecture
 
@@ -50,9 +50,9 @@
 
 ```text
 [1] App
-    -> AsyncOmniV1.generate(prompt, request_id)
+    -> AsyncOmni.generate(prompt, request_id)
 
-[2] AsyncOmniV1
+[2] AsyncOmni
     -> _final_output_handler()   (started on first request)
     -> AsyncOmniEngine.add_request(stage_id=0, ...)
 
@@ -77,11 +77,11 @@
          -> next_stage.add_request_async(...)
     -> output_queue.put(output)
 
-[6] AsyncOmniV1._final_output_loop (background coroutine)
+[6] AsyncOmni._final_output_loop (background coroutine)
     -> AsyncOmniEngine.try_get_output_blocking()
     -> route by request_id to ClientRequestState.queue
 
-[7] AsyncOmniV1._process_orchestrator_results
+[7] AsyncOmni._process_orchestrator_results
     -> read from ClientRequestState.queue
     -> _process_single_result(...)
     -> yield OmniRequestOutput
@@ -96,15 +96,15 @@
 ```mermaid
 sequenceDiagram
     participant APP as App
-    participant V1 as AsyncOmniV1
+    participant AO as AsyncOmni
     participant ENG as AsyncOmniEngine
     participant ORCH as Orchestrator
     participant S0 as Stage-0 Client
     participant SN as Next Stage Client
 
-    APP->>V1: generate
-    V1->>V1: start output_handler once
-    V1->>ENG: add_request(stage_id=0, ...)
+    APP->>AO: generate
+    AO->>AO: start output_handler once
+    AO->>ENG: add_request(stage_id=0, ...)
     ENG->>ENG: input_processor.process_inputs()
     ENG->>ORCH: request_queue.put(add_request)
 
@@ -120,9 +120,9 @@ sequenceDiagram
         ORCH-->>ENG: output_queue.put
     end
 
-    V1->>ENG: try_get_output_blocking
-    ENG-->>V1: message
-    V1-->>APP: yield OmniRequestOutput
+    AO->>ENG: try_get_output_blocking
+    ENG-->>AO: message
+    AO-->>APP: yield OmniRequestOutput
 ```
 
 ## 4. Comparison
@@ -155,7 +155,7 @@ V0:
 └──────────────────────┘   └──────────────────────┘   └──────────────────────┘
 ```
 
-V1:
+Current:
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐

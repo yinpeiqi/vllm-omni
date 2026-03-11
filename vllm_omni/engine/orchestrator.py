@@ -659,7 +659,7 @@ class Orchestrator:
     async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
         """Handle a control-plane RPC request from the main thread.
 
-        TODO(AsyncOmniV1): parallelize stage dispatch if control latency becomes
+        TODO(AsyncOmni): parallelize stage dispatch if control latency becomes
         noticeable. The current sequential fanout keeps the first version simple
         and deterministic.
         """

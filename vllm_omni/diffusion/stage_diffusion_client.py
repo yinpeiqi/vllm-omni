@@ -103,7 +103,7 @@ class StageDiffusionClient:
     ) -> Any:
         """Best-effort control RPC shim for diffusion stages.
 
-        TODO(AsyncOmniV1): add dedicated wrappers on AsyncOmniDiffusion for the
+        TODO(AsyncOmni): add dedicated wrappers on AsyncOmniDiffusion for the
         remaining control APIs instead of reaching into its underlying engine.
         """
         kwargs = kwargs or {}

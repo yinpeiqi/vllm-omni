@@ -330,13 +330,13 @@ Stage transitions are the mechanism by which outputs from one stage are converte
 
 ### Where Stage Transitions Are Called
 
-Stage transitions happen automatically in the orchestrator (`OmniLLM` class) during the generation loop. Here's the detailed flow:
+Stage transitions happen automatically in the orchestrator (`Omni` / `OmniBase`) during the generation loop. Here's the detailed flow:
 
-1. **Location**: `vllm_omni/entrypoints/omni_llm.py` in the `_run_generation()` method
+1. **Location**: `vllm_omni/entrypoints/omni_base.py` in the generation loop
 2. **Trigger**: When a stage completes processing and produces outputs
 3. **Execution Flow**:
    ```python
-   # In omni_llm.py, _run_generation() method (around line 345-460)
+   # In omni_base.py, generation loop
 
    # Main orchestrator loop polls each stage for completed requests
    for stage_id, stage in enumerate(self.stage_list):
@@ -377,7 +377,7 @@ The stage transition process follows these steps:
 
 2. **Transition Detection**: The orchestrator checks if there's a next stage and calls `process_engine_inputs()` on it
 
-3. **Input Processing**: The `process_engine_inputs()` method in `OmniStage` (`omni_stage.py`) handles the transition:
+3. **Input Processing**: The stage input processor configured in stage YAML (under `vllm_omni/stage_input_processors/`) handles the transition:
    ```python
    def process_engine_inputs(
        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None

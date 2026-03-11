@@ -52,8 +52,8 @@ def omni_snapshot_download(model_id: str) -> str:
 OutputMessageHandleResult = tuple[Literal[True], None, None, None] | tuple[Literal[False], str, int, ClientRequestState]
 
 
-class OmniV1Base:
-    """Shared runtime foundation for AsyncOmniV1 and OmniV1."""
+class OmniBase:
+    """Shared runtime foundation for AsyncOmni and Omni."""
 
     def __init__(
         self,
@@ -67,7 +67,7 @@ class OmniV1Base:
         **kwargs: Any,
     ) -> None:
         if "log_requests" in kwargs:
-            raise TypeError("`log_requests` has been removed in OmniV1/AsyncOmniV1. Use `log_stats`.")
+            raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)
         self.model = model
         self.log_stats = log_stats
