@@ -21,12 +21,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni_base import (
-    OmniBase,
-)
-from vllm_omni.entrypoints.omni_base import (
-    omni_snapshot_download as _omni_snapshot_download,
-)
+from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -39,11 +34,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
-
-
-def omni_snapshot_download(model_id: str) -> str:
-    """Backward-compatible import location for snapshot helper."""
-    return _omni_snapshot_download(model_id)
 
 
 class AsyncOmni(EngineClient, OmniBase):

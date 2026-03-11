@@ -246,19 +246,6 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
     return False, obj
 
 
-def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -> Any:
-    """Load object from container that may carry SHM or inline object.
-
-    Deprecated: prefer `maybe_load_from_ipc_with_metrics` to also obtain
-    decode-time and size metrics.
-    """
-    if shm_key in container:
-        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
-
-        return OmniSerializer.deserialize(shm_read_bytes(container[shm_key]))
-    return container[obj_key]
-
-
 def maybe_load_from_ipc_with_metrics(
     container: dict[str, Any], obj_key: str, shm_key: str
 ) -> tuple[Any, dict[str, float]]:
@@ -321,58 +308,3 @@ def _to_dict(x: Any) -> dict[str, Any]:
             return dict(x)
         except Exception:
             return {}
-
-
-def _resolve_model_to_local_path(model: str) -> str:
-    """Resolve an HF Hub model ID to its local cache snapshot path."""
-    if os.path.isdir(model):
-        return model
-
-    try:
-        from huggingface_hub import snapshot_download
-
-        # no network access is attempted, check local model path only
-        return snapshot_download(model, local_files_only=True)
-    except Exception:
-        logger.warning(f"Could not resolve {model} to a local snapshot path; using as-is", exc_info=True)
-        return model
-
-
-def _resolve_model_tokenizer_paths(
-    model: str,
-    engine_args: dict,
-) -> str:
-    """Resolve model and tokenizer paths for non-standard directory structures.
-
-    Some models (e.g., GLM-Image) have tokenizer in root and model in subdirectory.
-    This function handles model_subdir and tokenizer_subdir engine_args.
-
-    When the base model path is an HF Hub ID rather than an absolute local path,
-    the ID is first resolved to the local snapshot directory so that subdirectory
-    joins produce valid filesystem paths.
-
-    Args:
-        model: Base model path or HF Hub model ID
-        engine_args: Engine arguments (modified in-place to remove subdir args
-            and set tokenizer if needed)
-
-    Returns:
-        Resolved model path (may be subdirectory of original)
-    """
-    model_subdir = engine_args.pop("model_subdir", None)
-    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
-    resolved_base = _resolve_model_to_local_path(model)
-
-    if model_subdir:
-        model = os.path.join(resolved_base, model_subdir)
-        logger.info(f"Using model subdirectory: {model}")
-
-    if tokenizer_subdir is not None:
-        tokenizer_path = os.path.join(resolved_base, tokenizer_subdir) if tokenizer_subdir else resolved_base
-        engine_args["tokenizer"] = tokenizer_path
-        logger.info(f"Using tokenizer from: {tokenizer_path}")
-    elif model_subdir and "tokenizer" not in engine_args:
-        engine_args["tokenizer"] = resolved_base
-        logger.info(f"Using tokenizer from base model path: {resolved_base}")
-
-    return model
