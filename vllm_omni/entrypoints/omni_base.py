@@ -70,6 +70,7 @@ class OmniBase:
         stage_configs: list[Any] | None = None,
         stage_configs_path: str | None = None,
         stage_init_timeout: int = 300,
+        init_timeout: int = 300,
         log_stats: bool = False,
         async_chunk: bool = False,
         output_modalities: list[str] | None = None,
@@ -89,6 +90,7 @@ class OmniBase:
             model=model,
             stage_configs=stage_configs,
             stage_configs_path=stage_configs_path,
+            init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             **kwargs,
         )

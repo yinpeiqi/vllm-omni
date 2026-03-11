@@ -20,7 +20,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni import Omni
+from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
 
