@@ -28,6 +28,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
@@ -566,20 +567,56 @@ class AsyncOmniEngine:
         """Create a default single-stage diffusion config from kwargs."""
         # We temporally create a default config for diffusion stage.
         # In the future, we should merge the default config with the user-provided config.
-        # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
-        if "dtype" in kwargs and not isinstance(kwargs["dtype"], str):
-            if not isinstance(kwargs["dtype"], torch.dtype):
-                raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(kwargs['dtype']).__name__}")
-            kwargs["dtype"] = str(kwargs["dtype"]).removeprefix("torch.")
+        normalized_kwargs = dict(kwargs)
 
-        cache_backend = kwargs.get("cache_backend", "none")
-        cache_config = AsyncOmniEngine._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
-        # TODO: hack, calculate devices based on parallel config.
-        devices = "0"
-        if "parallel_config" in kwargs:
-            num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
+        # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
+        if "dtype" in normalized_kwargs and not isinstance(normalized_kwargs["dtype"], str):
+            if not isinstance(normalized_kwargs["dtype"], torch.dtype):
+                raise TypeError(
+                    f"Provided dtype must be a string or torch.dtype, got {type(normalized_kwargs['dtype']).__name__}"
+                )
+            normalized_kwargs["dtype"] = str(normalized_kwargs["dtype"]).removeprefix("torch.")
+
+        cache_backend = normalized_kwargs.get("cache_backend", "none")
+        cache_config = AsyncOmniEngine._normalize_cache_config(
+            cache_backend,
+            normalized_kwargs.get("cache_config", None),
+        )
+
+        parallel_config = normalized_kwargs.get("parallel_config")
+        if isinstance(parallel_config, dict):
+            parallel_config = DiffusionParallelConfig.from_dict(parallel_config)
+        if parallel_config is None:
+            ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
+            ring_degree = normalized_kwargs.get("ring_degree") or 1
+            sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
+            tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
+            cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
+            vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            use_hsdp = normalized_kwargs.get("use_hsdp", False)
+            hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
+            hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
+            if sequence_parallel_size is None:
+                sequence_parallel_size = ulysses_degree * ring_degree
+
+            parallel_config = DiffusionParallelConfig(
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                tensor_parallel_size=tensor_parallel_size,
+                sequence_parallel_size=sequence_parallel_size,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
+                cfg_parallel_size=cfg_parallel_size,
+                vae_patch_parallel_size=vae_patch_parallel_size,
+                use_hsdp=use_hsdp,
+                hsdp_shard_size=hsdp_shard_size,
+                hsdp_replicate_size=hsdp_replicate_size,
+            )
+
+        num_devices = max(1, int(parallel_config.world_size))
+        devices = ",".join(str(i) for i in range(num_devices))
+        normalized_kwargs["parallel_config"] = parallel_config
+
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -591,7 +628,7 @@ class AsyncOmniEngine:
                 },
                 "engine_args": OmegaConf.create(
                     {
-                        **kwargs,
+                        **normalized_kwargs,
                         "cache_backend": cache_backend,
                         "cache_config": cache_config,
                     }
