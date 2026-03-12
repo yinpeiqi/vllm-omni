@@ -133,21 +133,25 @@ class FakeAsyncOmni:
 
 @pytest.fixture
 def mock_async_diffusion(mocker: MockerFixture):
-    """Mock AsyncOmniDiffusion instance that returns fake images"""
-    mock = mocker.Mock()
-    mock.is_running = True  # For health endpoint
-    mock.check_health = mocker.AsyncMock()  # For LLM mode health check
+    """Mock diffusion engine that matches the current async-generator API."""
 
-    async def generate(**kwargs):
-        # Return n PIL images wrapped in result object
-        n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
-        mock.captured_sampling_params_list = kwargs["sampling_params_list"]
-        mock.captured_prompt = kwargs["prompt"]
-        images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
-        return MockGenerationResult(images)
+    class MockAsyncDiffusion:
+        def __init__(self) -> None:
+            self.is_running = True
+            self.check_health = mocker.AsyncMock()
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self.generate_calls = 0
 
-    mock.generate = mocker.AsyncMock(side_effect=generate)
-    return mock
+        async def generate(self, **kwargs):
+            self.generate_calls += 1
+            n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
+            self.captured_sampling_params_list = kwargs["sampling_params_list"]
+            self.captured_prompt = kwargs["prompt"]
+            images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
+            yield MockGenerationResult(images)
+
+    return MockAsyncDiffusion()
 
 
 @pytest.fixture
@@ -545,13 +549,12 @@ def test_parameters_passed_through(test_client, mock_async_diffusion):
     )
     assert response.status_code == 200
 
-    # Ensure generate() was called exactly once
-    mock_async_diffusion.generate.assert_awaited_once()
-    call_kwargs = mock_async_diffusion.generate.call_args[1]["sampling_params_list"][0]
-    assert call_kwargs.num_inference_steps == 100
-    assert call_kwargs.guidance_scale == 7.5
-    assert call_kwargs.true_cfg_scale == 3.0
-    assert call_kwargs.seed == 42
+    assert mock_async_diffusion.generate_calls == 1
+    captured = mock_async_diffusion.captured_sampling_params_list[0]
+    assert captured.num_inference_steps == 100
+    assert captured.guidance_scale == 7.5
+    assert captured.true_cfg_scale == 3.0
+    assert captured.seed == 42
 
 
 def test_model_field_omitted_works(test_client):
