@@ -81,6 +81,7 @@ from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
+from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
@@ -354,11 +355,8 @@ async def build_async_omni_from_stage_config(
     async_omni: EngineClient | None = None
 
     try:
-        # Convert args Namespace to kwargs dict for AsyncOmni to use
-        kwargs = vars(args).copy()
-        # Remove model as it will be passed separately
-        kwargs.pop("model", None)
-        async_omni = AsyncOmni(model=args.model, **kwargs)
+        engine_args = OmniEngineArgs.from_cli_args(args)
+        async_omni = AsyncOmni(model=engine_args.model, engine_args=engine_args)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()

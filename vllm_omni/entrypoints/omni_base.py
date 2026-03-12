@@ -6,7 +6,7 @@ import types
 import weakref
 from collections.abc import Sequence
 from pprint import pformat
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
@@ -18,6 +18,9 @@ from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
 
 logger = init_logger(__name__)
 
@@ -67,8 +70,7 @@ class OmniBase:
     def __init__(
         self,
         model: str,
-        stage_configs: list[Any] | None = None,
-        stage_configs_path: str | None = None,
+        engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 300,
         log_stats: bool = False,
@@ -88,8 +90,7 @@ class OmniBase:
         st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
-            stage_configs=stage_configs,
-            stage_configs_path=stage_configs_path,
+            engine_args=engine_args,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             **kwargs,

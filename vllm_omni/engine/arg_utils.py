@@ -1,3 +1,5 @@
+import argparse
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -85,6 +87,12 @@ class OmniEngineArgs(EngineArgs):
     def __post_init__(self) -> None:
         load_omni_general_plugins()
         super().__post_init__()
+
+    @classmethod
+    def from_cli_args(cls, args: argparse.Namespace) -> "OmniEngineArgs":
+        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        engine_args = cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
+        return engine_args
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):

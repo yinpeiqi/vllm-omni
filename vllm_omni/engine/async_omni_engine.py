@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import json
 import os
 import queue
@@ -17,7 +18,10 @@ import time
 import uuid
 import weakref
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
 
 import janus
 import torch
@@ -50,9 +54,7 @@ from vllm_omni.engine.stage_init import (
     setup_stage_devices,
 )
 from vllm_omni.entrypoints.utils import (
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
-    resolve_model_config_path,
+    load_and_resolve_stage_configs,
 )
 
 logger = init_logger(__name__)
@@ -107,8 +109,6 @@ class AsyncOmniEngine:
 
     Args:
         model: Model name or path
-        stage_configs: List of stage configurations. If None, loads from model.
-        stage_configs_path: Path to YAML file with stage configs.
         init_timeout: Total timeout waiting for orchestrator startup (seconds).
         stage_init_timeout: Timeout for stage initialization (seconds)
         **kwargs: Additional arguments
@@ -407,8 +407,7 @@ class AsyncOmniEngine:
     def __init__(
         self,
         model: str,
-        stage_configs: list[Any] | None = None,
-        stage_configs_path: str | None = None,
+        engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 300,
         **kwargs: Any,
@@ -418,30 +417,19 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
-        # --- Resolve stage configs (same logic as before) ---
-        tokenizer = kwargs.get("tokenizer", None)
-        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
+        # Merge typed engine_args fields into kwargs; explicit kwargs take priority.
+        if engine_args is not None:
+            ea_dict = {
+                f.name: getattr(engine_args, f.name)
+                for f in dataclasses.fields(engine_args)
+                if not f.name.startswith("_")
+            }
+            # Remove model since it is passed as a positional arg already.
+            ea_dict.pop("model", None)
+            kwargs = {**ea_dict, **kwargs}
 
-        if stage_configs is not None:
-            self.config_path = stage_configs_path
-            # Keep caller-provided structured configs as-is.
-            resolved_configs = stage_configs
-            if isinstance(resolved_configs, list) and resolved_configs and isinstance(resolved_configs[0], dict):
-                resolved_configs = OmegaConf.create(resolved_configs)
-        elif stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            resolved_configs = load_stage_configs_from_model(
-                config_path=self.config_path,
-                base_engine_args=base_engine_args,
-            )
-            if not resolved_configs:
-                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
-                resolved_configs = OmegaConf.create(default_stage_cfg)
-        else:
-            self.config_path = stage_configs_path
-            resolved_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
-        self.stage_configs = resolved_configs
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
@@ -691,6 +679,51 @@ class AsyncOmniEngine:
         ]
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
+
+    def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
+        """Resolve stage configs and inject defaults shared by orchestrator/headless."""
+
+        stage_configs_path = kwargs.get("stage_configs_path", None)
+
+        # TTS-specific CLI overrides
+        self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
+
+        # Load stage configurations from YAML
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model,
+            stage_configs_path,
+            kwargs,
+            default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
+        )
+
+        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        for cfg in stage_configs:
+            try:
+                if getattr(cfg, "stage_type", None) != "diffusion":
+                    continue
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = OmegaConf.create({})
+                if kwargs.get("lora_path") is not None:
+                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
+                        cfg.engine_args.lora_path = kwargs["lora_path"]
+                lora_scale = kwargs.get("lora_scale")
+                if lora_scale is None:
+                    # Backwards compatibility for older callers.
+                    lora_scale = kwargs.get("static_lora_scale")
+                if lora_scale is not None:
+                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
+                        cfg.engine_args.lora_scale = lora_scale
+                quantization_config = kwargs.get("quantization_config")
+                if quantization_config is not None:
+                    if (
+                        not hasattr(cfg.engine_args, "quantization_config")
+                        or cfg.engine_args.quantization_config is None
+                    ):
+                        cfg.engine_args.quantization_config = quantization_config
+            except Exception as e:
+                logger.warning("Failed to inject LoRA config for stage: %s", e)
+
+        return config_path, stage_configs
 
     # ==================== Public API ====================
 

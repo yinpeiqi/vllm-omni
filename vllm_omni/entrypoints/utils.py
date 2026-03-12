@@ -1,7 +1,7 @@
 import os
 import types
 from collections import Counter
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -144,7 +144,10 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     # Note: asdict() recursively converts nested dataclasses but not Counter objects,
     # so we need to recursively process the result
     if is_dataclass(obj):
-        result = asdict(obj)
+        # Only include init=True fields to avoid passing runtime-only fields
+        # (e.g. CompilationConfig has init=False fields like enabled_custom_ops,
+        # compilation_time, etc. that pydantic rejects when passed back to __init__)
+        result = {f.name: getattr(obj, f.name) for f in fields(obj) if f.init}
         # Recursively process the result to convert any Counter objects
         return _convert_dataclasses_to_dict(result)
     # Handle dictionaries (recurse into values) and filter out callables(cause error in OmegaConf.create)
@@ -291,9 +294,9 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
             runtime_cfg = stage_arg.runtime
             max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
             base_engine_args_tmp["max_num_seqs"] = max_batch_size
-            base_engine_args_tmp.async_chunk = global_async_chunk
-        stage_arg.engine_args = base_engine_args_tmp
-    return stage_args
+            base_engine_args_tmp["async_chunk"] = global_async_chunk
+        stage_arg["engine_args"] = base_engine_args_tmp
+    return OmegaConf.create(stage_args)
 
 
 def load_and_resolve_stage_configs(
