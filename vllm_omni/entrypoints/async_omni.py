@@ -18,6 +18,7 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
+from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -583,6 +584,10 @@ class AsyncOmni(EngineClient, OmniBase):
         TODO: Forward to Orchestrator process via message.
         """
         pass
+
+    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        """Return the task set exposed by the orchestrator-backed engine."""
+        return tuple(self.engine.supported_tasks)
 
     async def check_health(self) -> None:
         """Check engine health by verifying the Orchestrator process is alive."""
