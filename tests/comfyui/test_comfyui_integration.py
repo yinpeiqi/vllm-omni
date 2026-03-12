@@ -11,6 +11,7 @@ import time
 import traceback
 from collections.abc import Iterable, Sequence
 from enum import StrEnum, auto
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,7 +41,7 @@ class ServerCase(NamedTuple):
 
     served_model: str
     stage_list: list
-    stage_configs: list[dict]
+    stage_configs: list[Any]
     outputs: list[OmniRequestOutput]
 
 
@@ -201,6 +202,26 @@ def _assert_sampling_param_values(received: OmniSamplingParams, expected: dict[s
         )
 
 
+def _make_stage_config(
+    stage_type: str,
+    *,
+    is_comprehension: bool = False,
+    model_stage: str | None = None,
+):
+    engine_args = SimpleNamespace()
+    if model_stage is not None:
+        engine_args.model_stage = model_stage
+    return SimpleNamespace(
+        stage_type=stage_type,
+        is_comprehension=is_comprehension,
+        engine_args=engine_args,
+    )
+
+
+def _stage_type(stage: Any) -> str | None:
+    return getattr(stage, "stage_type", None)
+
+
 def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: SamplingCase, server_case: ServerCase):
     async def _mock_generate(*args, **kwargs):
         received_sampling_params_list: Sequence[OmniSamplingParams] | None = (
@@ -284,7 +305,7 @@ def mock_async_omni(server_case: ServerCase, sampling_case: SamplingCase):
         mock_instance.stage_list = server_case.stage_list
         mock_instance.stage_configs = server_case.stage_configs
         mock_instance.default_sampling_params_list = [
-            SamplingParams() if stage.get("stage_type") != "diffusion" else MagicMock()
+            SamplingParams() if _stage_type(stage) != "diffusion" else MagicMock()
             for stage in server_case.stage_configs
         ]
         mock_instance.errored = False
@@ -355,7 +376,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="Tongyi-MAI/Z-Image-Turbo",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_images_endpoint()],
             ),
             "Tongyi-MAI/Z-Image-Turbo",
@@ -366,7 +387,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="ByteDance-Seed/BAGEL-7B-MoT",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],
             ),
             "ByteDance-Seed/BAGEL-7B-MoT",
@@ -377,7 +398,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="Qwen/Qwen-Image-Edit",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_images_endpoint()],
             ),
             "Qwen/Qwen-Image-Edit",
@@ -388,7 +409,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="ByteDance-Seed/BAGEL-7B-MoT",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],
             ),
             "ByteDance-Seed/BAGEL-7B-MoT",
@@ -446,9 +467,9 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
                     MagicMock(is_comprehension=False, model_stage="llm"),
                 ],
                 stage_configs=[
-                    {"stage_type": "llm"},
-                    {"stage_type": "llm"},
-                    {"stage_type": "llm"},
+                    _make_stage_config("llm", is_comprehension=True, model_stage="thinker"),
+                    _make_stage_config("llm", is_comprehension=False, model_stage="talker"),
+                    _make_stage_config("llm", is_comprehension=False, model_stage="code2wav"),
                 ],
                 outputs=[_build_audio_chat_output(), _build_text_output("Understanding response")],
             ),
@@ -503,7 +524,7 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
             ServerCase(
                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
                 stage_list=["llm"],
-                stage_configs=[{"stage_type": "llm"}],
+                stage_configs=[_make_stage_config("llm", model_stage="qwen3_tts")],
                 outputs=[_build_audio_speech_output()],
             ),
             VLLMOmniTTS,
@@ -521,7 +542,7 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
             ServerCase(
                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
                 stage_list=["llm"],
-                stage_configs=[{"stage_type": "llm"}],
+                stage_configs=[_make_stage_config("llm", model_stage="qwen3_tts")],
                 outputs=[_build_audio_speech_output()],
             ),
             VLLMOmniVoiceClone,
