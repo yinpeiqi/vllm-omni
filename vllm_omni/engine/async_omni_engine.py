@@ -668,13 +668,24 @@ class AsyncOmniEngine:
                     "devices": devices,
                     "max_batch_size": 1,
                 },
-                "engine_args": OmegaConf.create(
-                    {
-                        **normalized_kwargs,
-                        "cache_backend": cache_backend,
-                        "cache_config": cache_config,
-                    }
-                ),
+                "engine_args": {
+                    "parallel_config": parallel_config,
+                    "model_class_name": kwargs.get("model_class_name", None),
+                    "vae_use_slicing": kwargs.get("vae_use_slicing", False),
+                    "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+                    "cache_backend": cache_backend,
+                    "cache_config": cache_config,
+                    "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
+                    "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+                    "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+                    "enforce_eager": kwargs.get("enforce_eager", False),
+                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
+                    "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
+                    "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
+                    "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
+                },
                 "final_output": True,
                 "final_output_type": "image",
             }
