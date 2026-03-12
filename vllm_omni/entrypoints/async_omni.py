@@ -120,7 +120,25 @@ class AsyncOmni(EngineClient, OmniBase):
     @property
     def renderer(self):
         """Return the renderer from the engine input processor when available."""
+        if self.input_processor is None:
+            return None
         return self.input_processor.renderer
+
+    @property
+    def vllm_config(self):
+        """Return the vLLM config for the comprehension stage when present."""
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is None:
+            return None
+        return self.engine.stage_vllm_configs[stage_index]
+
+    @property
+    def model_config(self):
+        """Return the model config for the comprehension stage when present."""
+        vllm_config = self.vllm_config
+        if vllm_config is None:
+            return None
+        return vllm_config.model_config
 
     # ==================== Generate Method ====================
 
@@ -546,20 +564,6 @@ class AsyncOmni(EngineClient, OmniBase):
         return EngineDeadError()
 
     # ==================== EngineClient Interface ====================
-
-    async def get_vllm_config(self) -> VllmConfig:
-        """Get vllm config for the comprehension stage."""
-        stage_index = self._get_comprehension_stage_index()
-        if stage_index is None:
-            return None  # type: ignore[return-value]
-        return self.engine.stage_vllm_configs[stage_index]
-
-    async def get_model_config(self) -> Any:
-        """Get model config for the comprehension stage."""
-        vllm_config = await self.get_vllm_config()
-        if vllm_config is not None:
-            return vllm_config.model_config
-        return self.model_config
 
     async def get_input_preprocessor(self) -> InputPreprocessor:
         """Get input preprocessor."""

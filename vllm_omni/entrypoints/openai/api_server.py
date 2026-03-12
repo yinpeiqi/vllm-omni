@@ -235,7 +235,12 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         await omni_init_app_state(engine_client, app.state, args)
 
-        vllm_config = await engine_client.get_vllm_config()
+        # Conditionally register profiler endpoints based on config or env var
+        if _should_enable_profiler_endpoints(args):
+            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+            app.include_router(profiler_router)
+
+        vllm_config = engine_client.vllm_config
 
         # Check if pure diffusion mode (vllm_config will be None)
         is_pure_diffusion = vllm_config is None
@@ -382,7 +387,7 @@ async def omni_init_app_state(
         args: Parsed command-line arguments
     """
     # Get vllm_config from engine_client (following 0.14.0 pattern)
-    vllm_config = await engine_client.get_vllm_config()
+    vllm_config = engine_client.vllm_config
 
     # Detect if it's pure Diffusion mode (single stage and is Diffusion)
     is_pure_diffusion = False
@@ -441,7 +446,7 @@ async def omni_init_app_state(
     # LLM or multi-stage mode: use standard initialization logic
     if vllm_config is None:
         # Try to get vllm_config from engine_client
-        vllm_config = await engine_client.get_vllm_config()
+        vllm_config = engine_client.vllm_config
         if vllm_config is None:
             logger.warning("vllm_config is None, some features may not work correctly")
 
