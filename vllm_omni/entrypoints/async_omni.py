@@ -100,6 +100,19 @@ class AsyncOmni(EngineClient, OmniBase):
         self.input_processor = self.engine.input_processor
 
         stage_index = self._get_comprehension_stage_index()
+        stage_debug_info: list[dict[str, Any]] = []
+        for idx, stage_client in enumerate(self.engine.stage_clients):
+            stage_debug_info.append(
+                {
+                    "stage_id": idx,
+                    "stage_type": getattr(stage_client, "stage_type", None),
+                    "is_comprehension": getattr(stage_client, "is_comprehension", None),
+                    "engine_input_source": getattr(stage_client, "engine_input_source", None),
+                    "model_stage": getattr(stage_client, "model_stage", None),
+                    "has_vllm_config": self.engine.stage_vllm_configs[idx] is not None,
+                }
+            )
+        logger.info("[AsyncOmni] stage selection: selected=%s stages=%s", stage_index, stage_debug_info)
         if stage_index is None:
             self.io_processor = None
         else:
@@ -114,8 +127,8 @@ class AsyncOmni(EngineClient, OmniBase):
                 continue
             if stage_client.is_comprehension:
                 return idx
-
-        return None
+        # default to stage 0 if no stage is explicitly marked as comprehension
+        return 0
 
     @property
     def renderer(self):
