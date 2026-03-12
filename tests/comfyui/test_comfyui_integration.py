@@ -33,6 +33,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
+from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -388,7 +389,7 @@ def mock_async_omni(server_case: ServerCase, sampling_case: SamplingCase):
             new=_mock_preprocess_chat,
         ),
     ):
-        mock_instance = AsyncMock()
+        mock_instance = AsyncMock(spec=RealAsyncOmni)
         mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
 
         mock_instance.stage_list = server_case.stage_list
