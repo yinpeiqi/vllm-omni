@@ -657,7 +657,6 @@ class AsyncOmniEngine:
 
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
-        normalized_kwargs["parallel_config"] = parallel_config
 
         default_stage_cfg = [
             {
