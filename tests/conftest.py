@@ -1509,9 +1509,9 @@ class OmniRunner:
         Returns:
             List of SamplingParams with default decoding for each stage
         """
-        if hasattr(self.omni, "default_sampling_params_list"):
-            return list(self.omni.default_sampling_params_list)
-        return [st.default_sampling_params for st in self.omni.stage_list]
+        if not hasattr(self.omni, "default_sampling_params_list"):
+            raise AttributeError("Omni.default_sampling_params_list is not available")
+        return list(self.omni.default_sampling_params_list)
 
     def get_omni_inputs(
         self,

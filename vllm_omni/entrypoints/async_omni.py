@@ -18,6 +18,7 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
+from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -99,6 +100,19 @@ class AsyncOmni(EngineClient, OmniBase):
         self.input_processor = self.engine.input_processor
 
         stage_index = self._get_comprehension_stage_index()
+        stage_debug_info: list[dict[str, Any]] = []
+        for idx, stage_client in enumerate(self.engine.stage_clients):
+            stage_debug_info.append(
+                {
+                    "stage_id": idx,
+                    "stage_type": getattr(stage_client, "stage_type", None),
+                    "is_comprehension": getattr(stage_client, "is_comprehension", None),
+                    "engine_input_source": getattr(stage_client, "engine_input_source", None),
+                    "model_stage": getattr(stage_client, "model_stage", None),
+                    "has_vllm_config": self.engine.stage_vllm_configs[idx] is not None,
+                }
+            )
+        logger.info("[AsyncOmni] stage selection: selected=%s stages=%s", stage_index, stage_debug_info)
         if stage_index is None:
             self.io_processor = None
         else:
@@ -113,13 +127,31 @@ class AsyncOmni(EngineClient, OmniBase):
                 continue
             if stage_client.is_comprehension:
                 return idx
-
-        return None
+        # default to stage 0 if no stage is explicitly marked as comprehension
+        return 0
 
     @property
     def renderer(self):
         """Return the renderer from the engine input processor when available."""
+        if self.input_processor is None:
+            return None
         return self.input_processor.renderer
+
+    @property
+    def vllm_config(self):
+        """Return the vLLM config for the comprehension stage when present."""
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is None:
+            return None
+        return self.engine.stage_vllm_configs[stage_index]
+
+    @property
+    def model_config(self):
+        """Return the model config for the comprehension stage when present."""
+        vllm_config = self.vllm_config
+        if vllm_config is None:
+            return None
+        return vllm_config.model_config
 
     # ==================== Generate Method ====================
 
@@ -546,20 +578,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== EngineClient Interface ====================
 
-    async def get_vllm_config(self) -> VllmConfig:
-        """Get vllm config for the comprehension stage."""
-        stage_index = self._get_comprehension_stage_index()
-        if stage_index is None:
-            return None  # type: ignore[return-value]
-        return self.engine.stage_vllm_configs[stage_index]
-
-    async def get_model_config(self) -> Any:
-        """Get model config for the comprehension stage."""
-        vllm_config = await self.get_vllm_config()
-        if vllm_config is not None:
-            return vllm_config.model_config
-        return self.model_config
-
     async def get_input_preprocessor(self) -> InputPreprocessor:
         """Get input preprocessor."""
         return self.input_processor
@@ -583,6 +601,10 @@ class AsyncOmni(EngineClient, OmniBase):
         TODO: Forward to Orchestrator process via message.
         """
         pass
+
+    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        """Return the task set exposed by the orchestrator-backed engine."""
+        return tuple(self.engine.supported_tasks)
 
     async def check_health(self) -> None:
         """Check engine health by verifying the Orchestrator process is alive."""
