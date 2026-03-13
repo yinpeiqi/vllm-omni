@@ -31,8 +31,8 @@ from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
+from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 

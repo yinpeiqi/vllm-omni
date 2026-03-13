@@ -287,6 +287,7 @@ query_map = {
     "text": get_text_query,
 }
 
+
 def main(args):
     model_name = "Qwen/Qwen2.5-Omni-7B"
 
