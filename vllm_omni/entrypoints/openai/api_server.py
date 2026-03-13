@@ -195,7 +195,7 @@ class _DiffusionServingModels:
             raise NotImplementedError(f"{self.name}.{attr} is not supported in diffusion mode")
 
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
-        self.base_model_paths = base_model_paths
+        self._base_model_paths = base_model_paths
         self.model_config = self._NullModelConfig()
 
     def __getattr__(self, name):
@@ -212,7 +212,7 @@ class _DiffusionServingModels:
                     root=base_model.model_path,
                     permission=[ModelPermission()],
                 )
-                for base_model in self.base_model_paths
+                for base_model in self._base_model_paths
             ]
         )
 
@@ -1396,8 +1396,8 @@ def _get_engine_and_model(raw_request: Request):
 
     # Get server's loaded model name
     serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
-    if serving_models and hasattr(serving_models, "base_model_paths") and serving_models.base_model_paths:
-        model_name = serving_models.base_model_paths[0].name
+    if serving_models and hasattr(serving_models, "_base_model_paths") and serving_models._base_model_paths:
+        model_name = serving_models._base_model_paths[0].name
     else:
         model_name = "unknown"
 
