@@ -26,7 +26,7 @@ from vllm.v1.executor import Executor
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.omni_stage import _resolve_worker_cls
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import resolve_model_config_path
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 
 logger = init_logger(__name__)
@@ -198,7 +198,8 @@ def build_vllm_config(
             stage_connector_spec=stage_connector_spec,
         )
 
-    omni_engine_args = OmniEngineArgs(**engine_args_dict)
+    filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+    omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
     vllm_config = omni_engine_args.create_engine_config(usage_context=UsageContext.LLM_CLASS)
     executor_class = Executor.get_class(vllm_config)
 
