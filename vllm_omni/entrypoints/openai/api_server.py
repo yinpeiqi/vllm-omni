@@ -188,12 +188,30 @@ class _DiffusionServingModels:
     provide a lightweight fallback.
     """
 
+    class _NullModelConfig:
+        def __getattr__(self, name):
+            return None
+
+    class _Unsupported:
+        def __init__(self, name: str):
+            self.name = name
+
+        def __call__(self, *args, **kwargs):
+            raise NotImplementedError(f"{self.name} is not supported in diffusion mode")
+
+        def __getattr__(self, attr):
+            raise NotImplementedError(f"{self.name}.{attr} is not supported in diffusion mode")
+
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
         self._base_model_paths = base_model_paths
+        self.model_config = self._NullModelConfig()
 
     @property
     def base_model_paths(self) -> list[BaseModelPath]:
         return self._base_model_paths
+
+    def __getattr__(self, name):
+        return self._Unsupported(name)
 
     async def show_available_models(self) -> ModelList:
         return ModelList(
@@ -203,7 +221,7 @@ class _DiffusionServingModels:
                     root=base_model.model_path,
                     permission=[ModelPermission()],
                 )
-                for base_model in self._base_model_paths
+                for base_model in self.base_model_paths
             ]
         )
 
