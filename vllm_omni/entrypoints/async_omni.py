@@ -123,13 +123,16 @@ class AsyncOmni(EngineClient, OmniBase):
             self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
 
     def _get_comprehension_stage_index(self) -> int | None:
+        fallback_idx: int | None = None
         for idx, stage_client in enumerate(self.engine.stage_clients):
             stage_vllm_config = self.engine.stage_vllm_configs[idx]
             if stage_vllm_config is None:
                 continue
+            if fallback_idx is None:
+                fallback_idx = idx
             if stage_client.is_comprehension:
                 return idx
-        return None
+        return fallback_idx
 
     @property
     def renderer(self):
