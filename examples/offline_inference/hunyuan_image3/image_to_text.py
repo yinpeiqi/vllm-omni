@@ -70,8 +70,8 @@ def main(args: argparse.Namespace) -> None:
     prompts = [prompt_dict]
     omni_outputs = omni.generate(prompts=prompts)
 
-    prompt_text = omni_outputs[0].request_output[0].prompt
-    generated_text = omni_outputs[0].request_output[0].outputs[0].text
+    prompt_text = omni_outputs[0].request_output.prompt
+    generated_text = omni_outputs[0].request_output.outputs[0].text
     print(f"Prompt: {prompt_text}")
     print(f"Text: {generated_text}")
 

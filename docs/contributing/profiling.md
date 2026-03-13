@@ -57,7 +57,7 @@ for stage_outputs in omni_generator:
     # ... [Output processing logic for text/audio would go here] ...
 
     # Update count to track when to stop profiling
-    processed_count += len(stage_outputs.request_output)
+    processed_count += 1
 
     # 2. Check if all requests are done to stop the profiler safely
     if profiler_enabled and processed_count >= total_requests:

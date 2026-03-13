@@ -287,14 +287,6 @@ query_map = {
     "text": get_text_query,
 }
 
-
-def _iter_request_outputs(stage_outputs):
-    request_output = stage_outputs.request_output
-    if isinstance(request_output, list):
-        return request_output
-    return [request_output]
-
-
 def main(args):
     model_name = "Qwen/Qwen2.5-Omni-7B"
 
@@ -398,34 +390,32 @@ def main(args):
     total_requests = len(prompts)
     processed_count = 0
     for stage_outputs in omni_generator:
-        request_outputs = _iter_request_outputs(stage_outputs)
+        output = stage_outputs.request_output
         if stage_outputs.final_output_type == "text":
-            for output in request_outputs:
-                request_id = output.request_id
-                text_output = output.outputs[0].text
-                # Save aligned text file per request
-                prompt_text = output.prompt
-                out_txt = os.path.join(output_dir, f"{request_id}.txt")
-                lines = []
-                lines.append("Prompt:\n")
-                lines.append(str(prompt_text) + "\n")
-                lines.append("vllm_text_output:\n")
-                lines.append(str(text_output).strip() + "\n")
-                try:
-                    with open(out_txt, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception as e:
-                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
-                print(f"Request ID: {request_id}, Text saved to {out_txt}")
+            request_id = output.request_id
+            text_output = output.outputs[0].text
+            # Save aligned text file per request
+            prompt_text = output.prompt
+            out_txt = os.path.join(output_dir, f"{request_id}.txt")
+            lines = []
+            lines.append("Prompt:\n")
+            lines.append(str(prompt_text) + "\n")
+            lines.append("vllm_text_output:\n")
+            lines.append(str(text_output).strip() + "\n")
+            try:
+                with open(out_txt, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+            except Exception as e:
+                print(f"[Warn] Failed writing text file {out_txt}: {e}")
+            print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
-            for output in request_outputs:
-                request_id = output.request_id
-                audio_tensor = output.outputs[0].multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-                sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+            request_id = output.request_id
+            audio_tensor = output.outputs[0].multimodal_output["audio"]
+            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+            sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
+            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
-        processed_count += len(request_outputs)
+        processed_count += 1
         if profiler_enabled and hasattr(omni_llm, "stop_profile") and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive

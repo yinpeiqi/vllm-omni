@@ -325,8 +325,8 @@ def main(args):
     for batch_start in range(0, len(inputs), batch_size):
         batch = inputs[batch_start : batch_start + batch_size]
         for stage_outputs in omni.generate(batch):
-            for output in stage_outputs.request_output:
-                _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+            output = stage_outputs.request_output
+            _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
 
 
 async def main_streaming(args):

@@ -408,11 +408,7 @@ def main():
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    request_output = first_output.request_output
-    if isinstance(request_output, list):
-        req_out = request_output[0]
-    else:
-        req_out = request_output
+    req_out = first_output.request_output
     if not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images'.")
 

@@ -366,42 +366,41 @@ def main(args):
     print(f"query type: {args.query_type}")
 
     for stage_outputs in omni_generator:
+        output = stage_outputs.request_output
         if stage_outputs.final_output_type == "text":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                text_output = output.outputs[0].text
-                # Save aligned text file per request
-                prompt_text = output.prompt
-                out_txt = os.path.join(output_dir, f"{request_id}.txt")
-                lines = []
-                lines.append("Prompt:\n")
-                lines.append(str(prompt_text) + "\n")
-                lines.append("vllm_text_output:\n")
-                lines.append(str(text_output).strip() + "\n")
-                try:
-                    with open(out_txt, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception as e:
-                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
-                print(f"Request ID: {request_id}, Text saved to {out_txt}")
+            request_id = output.request_id
+            text_output = output.outputs[0].text
+            # Save aligned text file per request
+            prompt_text = output.prompt
+            out_txt = os.path.join(output_dir, f"{request_id}.txt")
+            lines = []
+            lines.append("Prompt:\n")
+            lines.append(str(prompt_text) + "\n")
+            lines.append("vllm_text_output:\n")
+            lines.append(str(text_output).strip() + "\n")
+            try:
+                with open(out_txt, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+            except Exception as e:
+                print(f"[Warn] Failed writing text file {out_txt}: {e}")
+            print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                audio_tensor = output.outputs[0].multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+            request_id = output.request_id
+            audio_tensor = output.outputs[0].multimodal_output["audio"]
+            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
-                # Convert to numpy array and ensure correct format
-                audio_numpy = audio_tensor.float().detach().cpu().numpy()
+            # Convert to numpy array and ensure correct format
+            audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
-                # Ensure audio is 1D (flatten if needed)
-                if audio_numpy.ndim > 1:
-                    audio_numpy = audio_numpy.flatten()
+            # Ensure audio is 1D (flatten if needed)
+            if audio_numpy.ndim > 1:
+                audio_numpy = audio_numpy.flatten()
 
-                # Save audio file with explicit WAV format
-                sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+            # Save audio file with explicit WAV format
+            sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
+            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
-        processed_count += len(stage_outputs.request_output)
+        processed_count += 1
         if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
