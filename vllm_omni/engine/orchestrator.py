@@ -27,10 +27,10 @@ from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_
 from vllm_omni.engine import (
     OmniEngineCoreRequest,
 )
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
-from vllm_omni.engine.serialization import serialize_additional_information
 
 logger = init_logger(__name__)
 

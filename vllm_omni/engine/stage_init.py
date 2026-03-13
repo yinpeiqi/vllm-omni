@@ -190,7 +190,6 @@ def build_vllm_config(
     Returns:
         (vllm_config, executor_class)
     """
-    stage_id = stage_config.stage_id
     if engine_args_dict is None:
         engine_args_dict = build_engine_args_dict(
             stage_config,
