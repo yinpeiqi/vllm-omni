@@ -167,7 +167,7 @@ class _DiffusionServingModels:
                     root=base_model.model_path,
                     permission=[ModelPermission()],
                 )
-                for base_model in self._base_model_paths
+                for base_model in self.base_model_paths
             ]
         )
 
