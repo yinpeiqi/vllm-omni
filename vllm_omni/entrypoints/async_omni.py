@@ -129,8 +129,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 continue
             if stage_client.is_comprehension:
                 return idx
-        # default to stage 0 if no stage is explicitly marked as comprehension
-        return 0
+        return None
 
     @property
     def renderer(self):
