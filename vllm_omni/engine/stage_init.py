@@ -198,8 +198,6 @@ def build_vllm_config(
             stage_connector_spec=stage_connector_spec,
         )
 
-    logger.info("[stage_init] Stage-%s engine_args_dict: %s", stage_id, engine_args_dict)
-
     omni_engine_args = OmniEngineArgs(**engine_args_dict)
     vllm_config = omni_engine_args.create_engine_config(usage_context=UsageContext.LLM_CLASS)
     executor_class = Executor.get_class(vllm_config)
