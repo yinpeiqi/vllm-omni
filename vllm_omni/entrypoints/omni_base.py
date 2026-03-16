@@ -72,7 +72,7 @@ class OmniBase:
         model: str,
         engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
-        init_timeout: int = 300,
+        init_timeout: int = 600,
         log_stats: bool = False,
         async_chunk: bool = False,
         output_modalities: list[str] | None = None,

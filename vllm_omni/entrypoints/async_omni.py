@@ -70,7 +70,7 @@ class AsyncOmni(EngineClient, OmniBase):
         stage_configs: list[Any] | None = None,
         stage_configs_path: str | None = None,
         stage_init_timeout: int = 300,
-        init_timeout: int = 300,
+        init_timeout: int = 600,
         log_stats: bool = False,
         async_chunk: bool = False,
         output_modalities: list[str] | None = None,

@@ -456,7 +456,7 @@ class AsyncOmniEngine:
         model: str,
         engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
-        init_timeout: int = 300,
+        init_timeout: int = 600,
         **kwargs: Any,
     ) -> None:
         self.model = model
