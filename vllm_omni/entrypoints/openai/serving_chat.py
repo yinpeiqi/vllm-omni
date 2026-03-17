@@ -326,6 +326,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
                 if is_img2img:
                     tprompt["modalities"] = ["img2img"]
+                else:
+                    tprompt["modalities"] = ["image"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
