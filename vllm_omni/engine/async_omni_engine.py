@@ -204,6 +204,7 @@ class AsyncOmniEngine:
         stage_connector_spec: dict[str, Any],
         stage_init_timeout: int,
         omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
+        llm_stage_launch_lock: threading.Lock,
     ) -> StartedLlmStage:
         """Launch one LLM stage to READY state in a helper thread."""
         from vllm_omni.platforms import current_omni_platform
@@ -213,7 +214,7 @@ class AsyncOmniEngine:
         device_control_env = current_omni_platform.device_control_env_var
 
         try:
-            with self._llm_stage_launch_lock:
+            with llm_stage_launch_lock:
                 previous_visible_devices = os.environ.get(device_control_env)
                 try:
                     setup_stage_devices(metadata.stage_id, metadata.runtime_cfg)
@@ -347,6 +348,7 @@ class AsyncOmniEngine:
         llm_stage_ids: list[int] = []
         llm_launch_futures: dict[int, concurrent.futures.Future[StartedLlmStage]] = {}
         started_llm_stages: dict[int, StartedLlmStage] = {}
+        llm_stage_launch_lock = threading.Lock()
 
         async_chunk = self.async_chunk
         prompt_expand_func = None
@@ -396,6 +398,7 @@ class AsyncOmniEngine:
                         stage_connector_spec,
                         stage_init_timeout,
                         omni_kv_connector,
+                        llm_stage_launch_lock,
                     )
 
                 concurrent.futures.wait(list(llm_launch_futures.values()))
@@ -553,7 +556,6 @@ class AsyncOmniEngine:
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
-        self._llm_stage_launch_lock = threading.Lock()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -861,8 +863,6 @@ class AsyncOmniEngine:
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
 
-        # TTS-specific CLI overrides
-        self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
 
         # Use the legacy config loading path (load_and_resolve_stage_configs).
         # StageConfigFactory wiring will be done in config refactor [2/N].
