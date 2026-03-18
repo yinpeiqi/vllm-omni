@@ -32,11 +32,7 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
     if not isinstance(lora_body, dict):
         raise ValueError("Invalid lora field: expected an object.")
 
-    lora_name = (
-        lora_body.get("name")
-        or lora_body.get("lora_name")
-        or lora_body.get("adapter")
-    )
+    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
     lora_path = (
         lora_body.get("local_path")
         or lora_body.get("path")
