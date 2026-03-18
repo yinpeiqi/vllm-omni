@@ -1512,7 +1512,12 @@ async def _generate_with_async_omni(
 ):
     engine_client = cast(AsyncOmni, engine_client)
     result = None
-    normalized_stage_configs = list(stage_configs or [])
+    normalized_stage_configs = list(stage_configs)
+    if not normalized_stage_configs:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Stage configs not found. Start server with a multi-stage omni model.",
+        )
     default_params_list: list[OmniSamplingParams] | None = getattr(
         engine_client,
         "default_sampling_params_list",
@@ -1523,27 +1528,24 @@ async def _generate_with_async_omni(
     else:
         default_params_list = list(default_params_list)
 
-    if normalized_stage_configs:
-        sampling_params_list: list[OmniSamplingParams] = []
-        for idx, stage_cfg in enumerate(normalized_stage_configs):
-            stage_type = get_stage_type(stage_cfg)
-            if stage_type == "diffusion":
-                sampling_params_list.append(gen_params)
-                continue
+    sampling_params_list: list[OmniSamplingParams] = []
+    for idx, stage_cfg in enumerate(normalized_stage_configs):
+        stage_type = get_stage_type(stage_cfg)
+        if stage_type == "diffusion":
+            sampling_params_list.append(gen_params)
+            continue
 
-            if idx < len(default_params_list):
-                default_stage_params = default_params_list[idx]
-            else:
-                default_stage_params = SamplingParams()
+        if idx < len(default_params_list):
+            default_stage_params = default_params_list[idx]
+        else:
+            default_stage_params = SamplingParams()
 
-            if hasattr(default_stage_params, "clone"):
-                try:
-                    default_stage_params = default_stage_params.clone()
-                except Exception:
-                    pass
-            sampling_params_list.append(default_stage_params)
-    else:
-        sampling_params_list = [gen_params]
+        if hasattr(default_stage_params, "clone"):
+            try:
+                default_stage_params = default_stage_params.clone()
+            except Exception:
+                pass
+        sampling_params_list.append(default_stage_params)
 
     async for output in engine_client.generate(
         sampling_params_list=sampling_params_list,

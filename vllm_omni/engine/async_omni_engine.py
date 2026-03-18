@@ -1072,6 +1072,10 @@ class AsyncOmniEngine:
             ),
         )
 
+    def is_alive(self) -> bool:
+        """Whether the orchestrator thread is alive."""
+        return bool(self.orchestrator_thread.is_alive())
+
     def shutdown(self) -> None:
         """Send shutdown message and wait for the Orchestrator thread to exit."""
         if getattr(self, "_shutdown_called", False):
@@ -1087,7 +1091,7 @@ class AsyncOmniEngine:
                 self.request_queue.sync_q.put_nowait({"type": "shutdown"})
         except Exception:
             pass
-        if hasattr(self, "orchestrator_thread") and self.orchestrator_thread.is_alive():
+        if self.is_alive():
             self.orchestrator_thread.join(timeout=10)
             if self.orchestrator_thread.is_alive():
                 logger.warning("[AsyncOmniEngine] Orchestrator thread did not exit in time")
