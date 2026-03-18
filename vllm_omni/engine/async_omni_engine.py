@@ -197,14 +197,101 @@ class AsyncOmniEngine:
         **kwargs: Additional arguments
     """
 
+    def __init__(
+        self,
+        model: str,
+        engine_args: OmniEngineArgs | None = None,
+        stage_init_timeout: int = 300,
+        init_timeout: int = 600,
+        **kwargs: Any,
+    ) -> None:
+        self.model = model
+        startup_timeout = int(init_timeout)
+
+        logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
+
+        # Merge typed engine_args fields into kwargs; explicit kwargs take priority.
+        if engine_args is not None:
+            ea_dict = {
+                f.name: getattr(engine_args, f.name)
+                for f in dataclasses.fields(engine_args)
+                if not f.name.startswith("_")
+            }
+            # Remove model since it is passed as a positional arg already.
+            ea_dict.pop("model", None)
+            kwargs = {**ea_dict, **kwargs}
+
+        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+
+        self.num_stages = len(self.stage_configs)
+        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
+        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        self.stage_clients: list[Any] = []
+        self.stage_vllm_configs: list[Any] = []
+        self.output_processors: list[MultimodalOutputProcessor | None] = []
+        self.input_processor: InputProcessor | None = None
+        self.supported_tasks: tuple[str, ...] = ("generate",)
+        self.default_sampling_params_list: list[Any] = []
+        self.stage_metadata: list[dict[str, Any]] = []
+        self.request_queue: janus.Queue[dict[str, Any]] | None = None
+        self.output_queue: janus.Queue[dict[str, Any]] | None = None
+        self.rpc_output_queue: janus.Queue[dict[str, Any]] | None = None
+        self._shutdown_called = False
+        self._weak_finalizer: weakref.finalize | None = None
+        self._rpc_lock = threading.Lock()
+
+        logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
+
+        # Launch orchestrator background thread
+        startup_future: concurrent.futures.Future = concurrent.futures.Future()
+
+        self.orchestrator_thread = threading.Thread(
+            target=self._bootstrap_orchestrator,
+            args=(
+                stage_init_timeout,
+                startup_future,
+            ),
+            daemon=True,
+            name="orchestrator",
+        )
+        self.orchestrator_thread.start()
+
+        # Wait for stage/runtime initialization result from orchestrator thread.
+        try:
+            startup_future.result(timeout=startup_timeout)
+        except concurrent.futures.TimeoutError as e:
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
+            raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s") from e
+        except Exception:
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+            raise
+
+        # Stage runtime fields are assigned directly on self by the bootstrap thread.
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_shutdown_async_omni_engine,
+            self.orchestrator_thread,
+            self.request_queue,
+            self.output_queue,
+            self.rpc_output_queue,
+        )
+
+        logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
+
     def _launch_llm_stage(
         self,
         stage_cfg: Any,
         metadata: Any,
         stage_connector_spec: dict[str, Any],
         stage_init_timeout: int,
-        omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
         llm_stage_launch_lock: threading.Lock,
+        omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
     ) -> StartedLlmStage:
         """Launch one LLM stage to READY state in a helper thread."""
         from vllm_omni.platforms import current_omni_platform
@@ -397,8 +484,8 @@ class AsyncOmniEngine:
                         metadata,
                         stage_connector_spec,
                         stage_init_timeout,
-                        omni_kv_connector,
                         llm_stage_launch_lock,
+                        omni_kv_connector,
                     )
 
                 concurrent.futures.wait(list(llm_launch_futures.values()))
@@ -513,93 +600,6 @@ class AsyncOmniEngine:
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
-
-    def __init__(
-        self,
-        model: str,
-        engine_args: OmniEngineArgs | None = None,
-        stage_init_timeout: int = 300,
-        init_timeout: int = 600,
-        **kwargs: Any,
-    ) -> None:
-        self.model = model
-        startup_timeout = int(init_timeout)
-
-        logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
-
-        # Merge typed engine_args fields into kwargs; explicit kwargs take priority.
-        if engine_args is not None:
-            ea_dict = {
-                f.name: getattr(engine_args, f.name)
-                for f in dataclasses.fields(engine_args)
-                if not f.name.startswith("_")
-            }
-            # Remove model since it is passed as a positional arg already.
-            ea_dict.pop("model", None)
-            kwargs = {**ea_dict, **kwargs}
-
-        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
-
-        self.num_stages = len(self.stage_configs)
-        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
-        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
-        self.stage_clients: list[Any] = []
-        self.stage_vllm_configs: list[Any] = []
-        self.output_processors: list[MultimodalOutputProcessor | None] = []
-        self.input_processor: InputProcessor | None = None
-        self.supported_tasks: tuple[str, ...] = ("generate",)
-        self.default_sampling_params_list: list[Any] = []
-        self.stage_metadata: list[dict[str, Any]] = []
-        self.request_queue: janus.Queue[dict[str, Any]] | None = None
-        self.output_queue: janus.Queue[dict[str, Any]] | None = None
-        self.rpc_output_queue: janus.Queue[dict[str, Any]] | None = None
-        self._shutdown_called = False
-        self._weak_finalizer: weakref.finalize | None = None
-        self._rpc_lock = threading.Lock()
-
-        logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
-
-        # Launch orchestrator background thread
-        startup_future: concurrent.futures.Future = concurrent.futures.Future()
-
-        self.orchestrator_thread = threading.Thread(
-            target=self._bootstrap_orchestrator,
-            args=(
-                stage_init_timeout,
-                startup_future,
-            ),
-            daemon=True,
-            name="orchestrator",
-        )
-        self.orchestrator_thread.start()
-
-        # Wait for stage/runtime initialization result from orchestrator thread.
-        try:
-            startup_future.result(timeout=startup_timeout)
-        except concurrent.futures.TimeoutError as e:
-            try:
-                self.shutdown()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
-            raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s") from e
-        except Exception:
-            try:
-                self.shutdown()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
-            raise
-
-        # Stage runtime fields are assigned directly on self by the bootstrap thread.
-        self._weak_finalizer = weakref.finalize(
-            self,
-            _weak_shutdown_async_omni_engine,
-            self.orchestrator_thread,
-            self.request_queue,
-            self.output_queue,
-            self.rpc_output_queue,
-        )
-
-        logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
     # ---- request helpers ----
 
@@ -862,7 +862,6 @@ class AsyncOmniEngine:
                 "`stage_configs` is not part of the public API. "
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
-
 
         # Use the legacy config loading path (load_and_resolve_stage_configs).
         # StageConfigFactory wiring will be done in config refactor [2/N].
