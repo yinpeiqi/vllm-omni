@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.stage_init_utils import validate_diffusion_stage_device_visibility
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -51,3 +54,24 @@ def test_default_stage_devices_from_sequence_parallel():
     )[0]
 
     assert stage_cfg["runtime"]["devices"] == "0,1,2,3"
+
+
+def test_diffusion_stage_device_visibility_fails_when_visible_devices_too_few(mocker, monkeypatch):
+    stage_cfg_dict = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "cfg_parallel_size": 2,
+            "ulysses_degree": 2,
+        }
+    )[0]
+    stage_cfg = SimpleNamespace(engine_args=stage_cfg_dict["engine_args"])
+    runtime_cfg = stage_cfg_dict["runtime"]
+
+    mock_platform = mocker.MagicMock()
+    mock_platform.device_control_env_var = "CUDA_VISIBLE_DEVICES"
+    mock_platform.device_type = "cuda"
+    mock_platform.get_device_count.return_value = 8
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", mock_platform)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,6")
+
+    with pytest.raises(ValueError, match=r"requires 4 visible cuda device\(s\), but only 2 are available"):
+        validate_diffusion_stage_device_visibility(0, stage_cfg, runtime_cfg)
