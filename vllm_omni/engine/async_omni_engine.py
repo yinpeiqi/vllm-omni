@@ -59,6 +59,7 @@ from vllm_omni.engine.stage_init_utils import (
     prepare_engine_environment,
     release_device_locks,
     setup_stage_devices,
+    validate_diffusion_stage_device_visibility,
 )
 from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
@@ -466,6 +467,7 @@ class AsyncOmniEngine:
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
 
                     if metadata.stage_type == "diffusion":
+                        validate_diffusion_stage_device_visibility(stage_id, stage_cfg, metadata.runtime_cfg)
                         setup_stage_devices(stage_id, metadata.runtime_cfg)
                         omni_conn_cfg, omni_from, omni_to = omni_kv_connector
                         if omni_conn_cfg:

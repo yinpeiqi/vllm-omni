@@ -212,12 +212,57 @@ def prepare_engine_environment() -> None:
         pass
 
 
+def _parse_visible_devices(visible_devices: str | None) -> list[str]:
+    if not visible_devices:
+        return []
+    return [device.strip() for device in visible_devices.split(",") if device.strip()]
+
+
+def validate_diffusion_stage_device_visibility(stage_id: int, stage_cfg: Any, runtime_cfg: Any) -> None:
+    """Validate diffusion stage device settings before mutating visibility env vars.
+
+    If the user already constrained visible devices (for example with
+    ``CUDA_VISIBLE_DEVICES``), require enough visible devices for the
+    diffusion parallel world size so we fail early instead of falling back to
+    incorrect logical IDs.
+    """
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.platforms import current_omni_platform
+
+    runtime_devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None
+    env_var = current_omni_platform.device_control_env_var
+    visible_devices_str = os.environ.get(env_var)
+    visible_devices = _parse_visible_devices(visible_devices_str)
+
+    engine_args = _to_dict(stage_cfg.engine_args)
+    parallel_config = engine_args.get("parallel_config")
+    if isinstance(parallel_config, dict):
+        parallel_config = DiffusionParallelConfig.from_dict(parallel_config)
+    elif not isinstance(parallel_config, DiffusionParallelConfig):
+        parallel_config = DiffusionParallelConfig()
+
+    required_device_count = int(parallel_config.world_size)
+    available_device_count = len(visible_devices) if visible_devices else current_omni_platform.get_device_count()
+    if available_device_count < required_device_count:
+        if visible_devices:
+            raise ValueError(
+                f"Stage-{stage_id} requires {required_device_count} visible {current_omni_platform.device_type} "
+                f"device(s), but only {available_device_count} are available via {env_var}={visible_devices_str}. "
+                f"Requested runtime.devices={runtime_devices!r}."
+            )
+        raise ValueError(
+            f"Stage-{stage_id} requires {required_device_count} {current_omni_platform.device_type} device(s), "
+            f"but only {available_device_count} are available. Requested runtime.devices={runtime_devices!r}."
+        )
+
+
 def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
     """Device mapping via set_stage_devices for a single stage."""
     try:
         from vllm_omni.platforms import current_omni_platform
 
         device_type = current_omni_platform.device_type
+        env_var = current_omni_platform.device_control_env_var
         set_stage_devices(
             stage_id,
             runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None,
@@ -227,7 +272,7 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
             "[stage_init] Stage-%s set devices for %s, runtime devices: %s",
             stage_id,
             device_type,
-            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None,
+            os.environ.get(env_var),
         )
     except Exception as e:
         logger.warning("Device setup failed for stage %s: %s", stage_id, e)
