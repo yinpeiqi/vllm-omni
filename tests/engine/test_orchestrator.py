@@ -7,6 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import janus
 import pytest
@@ -23,11 +24,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @dataclass
 class OrchestratorFixture:
     orchestrator: Orchestrator
-    request_queue: janus.Queue
-    output_queue: janus.Queue
+    request_sync_q: Any
+    output_sync_q: Any
     queues: tuple[janus.Queue, ...]
-    thread: threading.Thread | None = None
-    result_future: concurrent.futures.Future[None] | None = None
+    thread: threading.Thread
+    result_future: concurrent.futures.Future[None]
 
 
 class FakeStageClient:
@@ -47,27 +48,29 @@ class FakeStageClient:
         self.add_request_calls: list[tuple] = []
         self.abort_calls: list[list[str]] = []
         self.shutdown_calls = 0
-        self.engine_core_outputs_queue: list[object] = []
-        self.diffusion_outputs_queue: list[object] = []
+        self._engine_core_outputs = queue.Queue()
+        self._diffusion_outputs = queue.Queue()
 
     # Orchestrator-facing interface.
     async def add_request_async(self, *args) -> None:
         self.add_request_calls.append(args)
 
     async def get_output_async(self):
-        if self.engine_core_outputs_queue:
-            return self.engine_core_outputs_queue.pop(0)
-        return SimpleNamespace(outputs=[])
+        try:
+            return self._engine_core_outputs.get_nowait()
+        except queue.Empty:
+            return SimpleNamespace(outputs=[])
 
     def get_diffusion_output_async(self):
-        if self.diffusion_outputs_queue:
-            return self.diffusion_outputs_queue.pop(0)
-        return None
+        try:
+            return self._diffusion_outputs.get_nowait()
+        except queue.Empty:
+            return None
 
     def set_engine_outputs(self, outputs) -> None:
         return None
 
-    def process_engine_inputs(self, stage_list, prompt=None):
+    def process_engine_inputs(self, _stage_list, prompt=None):
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -78,10 +81,10 @@ class FakeStageClient:
 
     # Test helpers for seeding fake stage outputs.
     def push_engine_core_outputs(self, outputs) -> None:
-        self.engine_core_outputs_queue.append(outputs)
+        self._engine_core_outputs.put_nowait(outputs)
 
     def push_diffusion_output(self, output) -> None:
-        self.diffusion_outputs_queue.append(output)
+        self._diffusion_outputs.put_nowait(output)
 
 
 class FakeOutputProcessor:
@@ -145,38 +148,38 @@ def _build_harness(
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
 ) -> OrchestratorFixture:
-    request_queue = janus.Queue()
-    output_queue = janus.Queue()
-    rpc_queue = janus.Queue()
     if output_processors is None:
         output_processors = [FakeOutputProcessor() for _ in stage_clients]
     if stage_vllm_configs is None:
         stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients]
-    orchestrator = Orchestrator(
-        request_async_queue=request_queue.async_q,
-        output_async_queue=output_queue.async_q,
-        rpc_async_queue=rpc_queue.async_q,
-        stage_clients=stage_clients,
-        output_processors=output_processors,
-        stage_vllm_configs=stage_vllm_configs,
-        async_chunk=async_chunk,
-    )
-    return OrchestratorFixture(
-        orchestrator=orchestrator,
-        request_queue=request_queue,
-        output_queue=output_queue,
-        queues=(request_queue, output_queue, rpc_queue),
-    )
 
-
-async def _start_orchestrator(orchestrator_fixture: OrchestratorFixture) -> asyncio.Task:
+    ready_future: concurrent.futures.Future[tuple[Orchestrator, janus.Queue, janus.Queue, janus.Queue]] = (
+        concurrent.futures.Future()
+    )
     result_future: concurrent.futures.Future[None] = concurrent.futures.Future()
 
     def _runner() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+
+        async def _run() -> None:
+            request_queue = janus.Queue()
+            output_queue = janus.Queue()
+            rpc_queue = janus.Queue()
+            orchestrator = Orchestrator(
+                request_async_queue=request_queue.async_q,
+                output_async_queue=output_queue.async_q,
+                rpc_async_queue=rpc_queue.async_q,
+                stage_clients=stage_clients,
+                output_processors=output_processors,
+                stage_vllm_configs=stage_vllm_configs,
+                async_chunk=async_chunk,
+            )
+            ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
+            await orchestrator.run()
+
         try:
-            loop.run_until_complete(orchestrator_fixture.orchestrator.run())
+            loop.run_until_complete(_run())
             result_future.set_result(None)
         except Exception as exc:
             result_future.set_exception(exc)
@@ -194,28 +197,24 @@ async def _start_orchestrator(orchestrator_fixture: OrchestratorFixture) -> asyn
 
     thread = threading.Thread(target=_runner, daemon=True, name="test-orchestrator")
     thread.start()
-    orchestrator_fixture.thread = thread
-    orchestrator_fixture.result_future = result_future
-    await asyncio.sleep(0.01)
-    return asyncio.current_task()
 
-
-async def _request_shutdown(orchestrator_fixture: OrchestratorFixture) -> None:
-    orchestrator_fixture.request_queue.sync_q.put_nowait({"type": "shutdown"})
-
-
-async def _join_orchestrator(orchestrator_fixture: OrchestratorFixture) -> None:
-    if orchestrator_fixture.thread is not None:
-        await asyncio.to_thread(orchestrator_fixture.thread.join, 5)
-        if orchestrator_fixture.thread.is_alive():
-            raise AssertionError("Timed out waiting for orchestrator thread shutdown")
-    if orchestrator_fixture.result_future is not None:
-        orchestrator_fixture.result_future.result(timeout=0)
+    orchestrator, request_queue, output_queue, rpc_queue = ready_future.result(timeout=5)
+    return OrchestratorFixture(
+        orchestrator=orchestrator,
+        request_sync_q=request_queue.sync_q,
+        output_sync_q=output_queue.sync_q,
+        queues=(request_queue, output_queue, rpc_queue),
+        thread=thread,
+        result_future=result_future,
+    )
 
 
 async def _shutdown_orchestrator(orchestrator_fixture: OrchestratorFixture) -> None:
-    await _request_shutdown(orchestrator_fixture)
-    await _join_orchestrator(orchestrator_fixture)
+    orchestrator_fixture.request_sync_q.put_nowait({"type": "shutdown"})
+    await asyncio.to_thread(orchestrator_fixture.thread.join, 5)
+    if orchestrator_fixture.thread.is_alive():
+        raise AssertionError("Timed out waiting for orchestrator thread shutdown")
+    orchestrator_fixture.result_future.result(timeout=0)
 
 
 async def _wait_for(predicate, *, timeout: float = 2.0) -> None:
@@ -232,7 +231,7 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
         if time.monotonic() >= deadline:
             raise AssertionError("Timed out waiting for orchestrator output")
         try:
-            msg = orchestrator_fixture.output_queue.sync_q.get_nowait()
+            msg = orchestrator_fixture.output_sync_q.get_nowait()
         except queue.Empty:
             await asyncio.sleep(0.01)
             continue
@@ -249,7 +248,7 @@ async def _enqueue_add_request(
     sampling_params_list,
     final_stage_id: int,
 ) -> None:
-    orchestrator_fixture.request_queue.sync_q.put_nowait(
+    orchestrator_fixture.request_sync_q.put_nowait(
         {
             "type": "add_request",
             "request_id": request_id,
@@ -262,7 +261,7 @@ async def _enqueue_add_request(
 
 
 async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, request_ids: list[str]) -> None:
-    orchestrator_fixture.request_queue.sync_q.put_nowait(
+    orchestrator_fixture.request_sync_q.put_nowait(
         {
             "type": "abort",
             "request_ids": request_ids,
@@ -272,25 +271,26 @@ async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, requ
 
 @pytest.fixture
 def orchestrator_factory():
-    queues: list[janus.Queue] = []
+    fixtures: list[OrchestratorFixture] = []
 
     def _factory(*args, **kwargs) -> OrchestratorFixture:
-        harness = _build_harness(*args, **kwargs)
-        queues.extend(harness.queues)
-        return harness
+        fixture = _build_harness(*args, **kwargs)
+        fixtures.append(fixture)
+        return fixture
 
     yield _factory
 
-    for q in queues:
-        q.close()
+    for fixture in fixtures:
+        if fixture.thread.is_alive():
+            fixture.request_sync_q.put_nowait({"type": "shutdown"})
+            fixture.thread.join(timeout=5)
+        for q in fixture.queues:
+            q.close()
 
 
 @pytest.mark.asyncio
 async def test_run_two_stage_llm(orchestrator_factory) -> None:
-    stage0 = FakeStageClient(
-        stage_type="llm",
-        final_output=False,
-    )
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(
         stage_type="llm",
         final_output=True,
@@ -301,7 +301,6 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         FakeOutputProcessor(request_outputs=[_build_request_output("req-llm", token_ids=[10, 11], finished=True)]),
     ]
     orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
-    await _start_orchestrator(orchestrator_fixture)
     request = SimpleNamespace(request_id="req-llm", prompt_token_ids=[1, 2, 3])
 
     try:
@@ -339,7 +338,6 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
 async def test_run_single_stage_diffusion(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     orchestrator_fixture = orchestrator_factory([stage0])
-    await _start_orchestrator(orchestrator_fixture)
     params = OmniDiffusionSamplingParams()
 
     try:
@@ -380,11 +378,7 @@ async def test_run_llm_to_diffusion(orchestrator_factory) -> None:
         FakeOutputProcessor(request_outputs=[_build_request_output("req-img", token_ids=[3, 4], finished=True)]),
         FakeOutputProcessor(),
     ]
-    orchestrator_fixture = orchestrator_factory(
-        [stage0, stage1],
-        output_processors=processors,
-    )
-    await _start_orchestrator(orchestrator_fixture)
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
     request = SimpleNamespace(request_id="req-img", prompt_token_ids=[1, 2, 3])
     params = OmniDiffusionSamplingParams()
     original_prompt = {"prompt": "draw a fox"}
@@ -437,7 +431,6 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         output_processors=processors,
         async_chunk=True,
     )
-    await _start_orchestrator(orchestrator_fixture)
     request = SimpleNamespace(request_id="req-async", prompt_token_ids=[1, 2, 3, 4])
 
     try:
@@ -475,11 +468,9 @@ async def test_run_shutdown(orchestrator_factory) -> None:
         FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image"),
     ]
     orchestrator_fixture = orchestrator_factory(stages)
-    await _start_orchestrator(orchestrator_fixture)
 
     await _shutdown_orchestrator(orchestrator_fixture)
 
-    assert orchestrator_fixture.thread is not None
     assert not orchestrator_fixture.thread.is_alive()
     for stage in stages:
         assert stage.shutdown_calls == 1
@@ -496,7 +487,6 @@ async def test_run_abort(orchestrator_factory) -> None:
         FakeOutputProcessor(request_outputs=[_build_request_output("req-abort", token_ids=[2], finished=True)]),
     ]
     orchestrator_fixture = orchestrator_factory(stages, output_processors=processors)
-    await _start_orchestrator(orchestrator_fixture)
     request = SimpleNamespace(request_id="req-abort", prompt_token_ids=[1, 2, 3])
 
     try:
@@ -511,7 +501,6 @@ async def test_run_abort(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
 
         await _enqueue_abort_request(orchestrator_fixture, ["req-abort"])
-
         await _wait_for(lambda: all(stage.abort_calls for stage in stages))
 
         for stage in stages:
