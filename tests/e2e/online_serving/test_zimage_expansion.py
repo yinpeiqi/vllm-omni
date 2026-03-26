@@ -4,7 +4,7 @@ for Z-Image.
 
 Coverage is intentionally limited to the minimal 4xL4 cases that
 exercise Z-Image's supported parallel feature combinations:
-- CacheDiT + FP8 + Ulysses=2 + TP=2 + VAE patch parallel=2
+- CacheDiT + FP8 + Ring=2 + TP=2
 - TeaCache + FP8 + Ulysses=2 + Ring=2
 """
 
@@ -34,13 +34,13 @@ def _get_diffusion_feature_cases():
                     "cache_dit",
                     "--quantization",
                     "fp8",
-                    "--ulysses-degree",
+                    "--ring",
                     "2",
                     "--tensor-parallel-size",
                     "2",
                 ],
             ),
-            id="parallel_cachedit_fp8_ulysses2_tp2_vae2",
+            id="parallel_cachedit_fp8_ring2_tp2",
             marks=FOUR_CARD_MARKS,
         ),
         pytest.param(
