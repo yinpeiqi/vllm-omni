@@ -370,6 +370,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                if finish_reason is not None:
+                    output_token_ids = getattr(request, "_output_token_ids", None)
+                    tail_token_ids = (
+                        list(output_token_ids[-8:]) if isinstance(output_token_ids, list) else output_token_ids
+                    )
+                    logger.info(
+                        "[Stage-%s] request stopping req=%s status_before=%s "
+                        "finish_reason=%s stop_reason=%s resumable=%s "
+                        "num_computed=%s num_prompt=%s prompt_len=%s output_len=%s "
+                        "sampling_max_tokens=%s tail_output_token_ids=%s",
+                        getattr(self.vllm_config.model_config, "stage_id", "?"),
+                        req_id,
+                        status_before_stop,
+                        finish_reason,
+                        getattr(request, "stop_reason", None),
+                        getattr(request, "resumable", None),
+                        getattr(request, "num_computed_tokens", None),
+                        getattr(request, "num_prompt_tokens", None),
+                        len(getattr(request, "prompt_token_ids", []) or []),
+                        None if output_token_ids is None else len(output_token_ids),
+                        getattr(getattr(request, "sampling_params", None), "max_tokens", None),
+                        tail_token_ids,
+                    )
                 is_segment_finished = request.is_finished() and request.resumable
                 finished = self._handle_stopped_request(request)
                 if finished:

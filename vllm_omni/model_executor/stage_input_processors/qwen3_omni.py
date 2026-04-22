@@ -274,21 +274,6 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
-    request_finished = bool(request.is_finished()) if callable(getattr(request, "is_finished", None)) else None
-    if is_finished or request_finished:
-        logger.info(
-            "[qwen3_omni thinker2talker_async_chunk] req=%s chunk_id=%s "
-            "kw_is_finished=%s request_finished=%s request_resumable=%s "
-            "prompt_len=%s output_len=%s pooling_keys=%s",
-            request_id,
-            chunk_id,
-            bool(is_finished),
-            request_finished,
-            bool(getattr(request, "resumable", False)),
-            None if getattr(request, "prompt_token_ids", None) is None else len(request.prompt_token_ids),
-            None if getattr(request, "output_token_ids", None) is None else len(request.output_token_ids),
-            None if not isinstance(pooling_output, dict) else sorted(pooling_output.keys()),
-        )
     if chunk_id == 0:
         all_token_ids = request.all_token_ids  # prefill + decode
         prompt_token_ids = request.prompt_token_ids
@@ -353,22 +338,6 @@ def thinker2talker_async_chunk(
             talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
 
-    if bool(talker_additional_info["finished"].item()) if isinstance(
-        talker_additional_info.get("finished"), torch.Tensor
-    ) else talker_additional_info.get("finished"):
-        logger.info(
-            "[qwen3_omni thinker2talker_async_chunk] req=%s chunk_id=%s emit_payload finished=%s "
-            "keys=%s output_token_ids_len=%s",
-            request_id,
-            chunk_id,
-            bool(talker_additional_info["finished"].item())
-            if isinstance(talker_additional_info.get("finished"), torch.Tensor)
-            else talker_additional_info.get("finished"),
-            sorted(talker_additional_info.keys()),
-            None
-            if "thinker_output_token_ids" not in talker_additional_info
-            else len(talker_additional_info["thinker_output_token_ids"]),
-        )
     return talker_additional_info
 
 
@@ -493,18 +462,6 @@ def talker2code2wav_async_chunk(
     Pooling version.
     """
     if "code_predictor_codes" not in pooling_output:
-        if is_finished or (
-            callable(getattr(request, "is_finished", None)) and bool(request.is_finished())
-        ):
-            logger.info(
-                "[qwen3_omni talker2code2wav_async_chunk] req=%s missing_code_predictor_codes "
-                "kw_is_finished=%s request_finished=%s request_resumable=%s pooling_keys=%s",
-                getattr(request, "external_req_id", None),
-                bool(is_finished),
-                bool(request.is_finished()) if callable(getattr(request, "is_finished", None)) else None,
-                bool(getattr(request, "resumable", False)),
-                sorted(pooling_output.keys()),
-            )
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -540,20 +497,6 @@ def talker2code2wav_async_chunk(
     transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size_config
-    request_finished = bool(request.is_finished()) if callable(getattr(request, "is_finished", None)) else None
-    if is_finished or request_finished:
-        logger.info(
-            "[qwen3_omni talker2code2wav_async_chunk] req=%s kw_is_finished=%s request_finished=%s "
-            "request_resumable=%s codec_codes_len=%s buffered_frames=%s chunk_size=%s chunk_length=%s",
-            request_id,
-            bool(is_finished),
-            request_finished,
-            bool(getattr(request, "resumable", False)),
-            len(codec_codes),
-            length,
-            chunk_size_config,
-            chunk_length,
-        )
     if chunk_length != 0 and not is_finished:
         return None
 
@@ -574,16 +517,6 @@ def talker2code2wav_async_chunk(
         "left_context_size": left_context_size,
         "finished": torch.tensor(is_finished, dtype=torch.bool),
     }
-    if bool(info["finished"].item()):
-        logger.info(
-            "[qwen3_omni talker2code2wav_async_chunk] req=%s emit_payload finished=%s "
-            "left_context_size=%s emitted_codes_len=%s buffered_frames=%s",
-            request_id,
-            bool(info["finished"].item()),
-            left_context_size,
-            len(codes),
-            length,
-        )
     return info
 
 

@@ -1655,30 +1655,7 @@ class OmniConnectorModelRunnerMixin:
                     request_finished = bool(is_finished_fn())
                     # For resumable streaming sessions, request.is_finished()
                     # can mean "current segment stopped" rather than "entire
-                    # request is terminal". Only propagate terminal finish to
-                    # async-chunk processors once the request is no longer
-                    # resumable.
                     kwargs["is_finished"] = request_finished and not bool(getattr(request, "resumable", False))
-                    if "qwen3_omni" in (self._custom_process_func_path or "") and (
-                        request_finished or kwargs.get("is_finished")
-                    ):
-                        prompt_token_ids = getattr(request, "prompt_token_ids", None)
-                        output_token_ids = getattr(request, "output_token_ids", None)
-                        logger.info(
-                            "[Stage-%s] qwen3_omni custom_process req=%s ext=%s func=%s "
-                            "request_finished=%s request_resumable=%s kw_is_finished=%s "
-                            "prompt_len=%s output_len=%s put_chunk=%s",
-                            self._stage_id,
-                            getattr(request, "request_id", request_id),
-                            getattr(request, "external_req_id", request_id),
-                            getattr(self._custom_process_func, "__name__", self._custom_process_func),
-                            request_finished,
-                            bool(getattr(request, "resumable", False)),
-                            kwargs.get("is_finished"),
-                            None if prompt_token_ids is None else len(prompt_token_ids),
-                            None if output_token_ids is None else len(output_token_ids),
-                            None if request_id is None else self._put_req_chunk.get(request_id),
-                        )
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
 
