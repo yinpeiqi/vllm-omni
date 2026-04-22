@@ -971,6 +971,13 @@ class Orchestrator:
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                 )
+                logger.info(
+                    "[Orchestrator] async_chunk prewarm req=%s stage-%s prompt_len=%s resumable=%s",
+                    request_id,
+                    next_stage_id,
+                    len(base_input["prompt_token_ids"]),
+                    getattr(request, "resumable", None),
+                )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
 
