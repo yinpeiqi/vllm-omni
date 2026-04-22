@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -140,6 +141,7 @@ class Orchestrator:
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
+        self._fatal_error: str | None = None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -167,6 +169,12 @@ class Orchestrator:
                 await asyncio.gather(request_task, output_task, return_exceptions=True)
             except Exception:
                 pass
+
+            # If a fatal error caused the shutdown, drain any pending
+            # add_request messages that were never processed and broadcast
+            # fatal error responses so callers are not left hanging.
+            if self._fatal_error is not None:
+                await self._drain_pending_requests_on_fatal()
 
             self._shutdown_stages()
 
@@ -349,8 +357,10 @@ class Orchestrator:
             target_pools.extend(self.stage_pools)
         else:
             for lid in requested_stage_ids:
-                if 0 <= lid < self.num_stages:
-                    target_pools.append(self.stage_pools[lid])
+                if not (0 <= lid < self.num_stages):
+                    logger.warning("[Orchestrator] collective_rpc: ignoring invalid stage_id %s", lid)
+                    continue
+                target_pools.append(self.stage_pools[lid])
 
         results: list[Any] = []
         stage_ids: list[int] = []
@@ -404,22 +414,55 @@ class Orchestrator:
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
                         idle = False
                     else:
-                        raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
-                        if raw_outputs is None:
-                            continue
-
-                        await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-                        for eco in raw_outputs.outputs:
-                            req_state = self.request_states.get(getattr(eco, "request_id", None))
-                            if req_state is None:
+                        try:
+                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
+                            if raw_outputs is None:
                                 continue
-                            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                            req_state.streaming.new_prompt_len_snapshot = getattr(
-                                eco,
-                                "new_prompt_len_snapshot",
-                                None,
+
+                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                            for eco in raw_outputs.outputs:
+                                req_state = self.request_states.get(getattr(eco, "request_id", None))
+                                if req_state is None:
+                                    continue
+                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                                req_state.streaming.new_prompt_len_snapshot = getattr(
+                                    eco,
+                                    "new_prompt_len_snapshot",
+                                    None,
+                                )
+                            raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                        except asyncio.CancelledError:
+                            raise
+                        except EngineDeadError as e:
+                            logger.error(
+                                "[Orchestrator] Stage-%s is dead: %s",
+                                stage_id,
+                                e,
                             )
-                        raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                            self._fatal_error = str(e)
+                            for req_id, req_state in list(self.request_states.items()):
+                                if stage_id in req_state.stage_submit_ts:
+                                    await self.output_async_queue.put(
+                                        {
+                                            "type": "error",
+                                            "error": str(e),
+                                            "fatal": True,
+                                            "request_id": req_id,
+                                        }
+                                    )
+                                    self.request_states.pop(req_id, None)
+                            self._shutdown_event.set()
+                            raise
+                        except Exception:
+                            if self._shutdown_event.is_set():
+                                return
+                            logger.exception(
+                                "[Orchestrator] Stage-%s replica-%s processing failed",
+                                stage_id,
+                                replica_id,
+                            )
+                            raise
+
                         await self._handle_processed_outputs(stage_id, replica_id, raw_output)
                         idle = False
 
@@ -713,11 +756,22 @@ class Orchestrator:
 
         if next_pool.stage_type == "diffusion":
             if next_client.custom_process_input_func is not None:
+                _t_ar2d = _time.perf_counter()
                 diffusion_prompt = next_client.custom_process_input_func(
                     source_outputs,
                     req_state.prompt,
                     requires_multimodal_data,
                 )
+                _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                logger.info(
+                    "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
+                    req_id,
+                    _dt_ar2d,
+                    src_stage_id,
+                    next_logical,
+                )
+                if already_submitted and isinstance(diffusion_prompt, list) and len(diffusion_prompt) == 1:
+                    diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
 
@@ -919,6 +973,53 @@ class Orchestrator:
         return sender_infos or None
 
     # ---- Shutdown / lifecycle ----
+
+    async def _drain_pending_requests_on_fatal(self) -> None:
+        """Drain the request queue and broadcast fatal errors for any
+        pending add_request messages that were never processed.
+
+        Called from the ``run()`` finally block when a fatal error
+        (e.g. ``EngineDeadError``) caused the orchestrator to shut down
+        before the request handler could process all queued messages.
+        Also broadcasts for any already-tracked requests still in
+        ``request_states`` that were not yet notified.
+        """
+        assert self._fatal_error is not None
+
+        notified: set[str] = set()
+
+        # 1) Drain pending messages from the request queue.
+        while True:
+            try:
+                msg = self.request_async_queue.get_nowait()
+            except Exception:
+                break
+            if msg.get("type") == "add_request":
+                req_id = msg["request_id"]
+                await self.output_async_queue.put(
+                    {
+                        "type": "error",
+                        "error": self._fatal_error,
+                        "fatal": True,
+                        "request_id": req_id,
+                    }
+                )
+                notified.add(req_id)
+
+        # 2) Broadcast for any tracked requests not already notified
+        #    (e.g. request was registered but the EngineDeadError handler
+        #    missed it because it wasn't submitted to the dead stage yet).
+        for req_id in list(self.request_states):
+            if req_id not in notified:
+                await self.output_async_queue.put(
+                    {
+                        "type": "error",
+                        "error": self._fatal_error,
+                        "fatal": True,
+                        "request_id": req_id,
+                    }
+                )
+            self.request_states.pop(req_id, None)
 
     def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""

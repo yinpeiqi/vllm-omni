@@ -19,17 +19,45 @@ from typing import Any, Literal
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class ReplicaInitPlan:
+    """One concrete replica startup unit within a logical stage."""
+
+    replica_id: int
+    num_replicas: int
+    launch_mode: str
+    stage_cfg: Any
+    metadata: Any
+    stage_connector_spec: dict[str, Any]
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
+    stage_vllm_config: Any | None = None
+    executor_class: type | None = None
+
+
+@dataclass
+class LogicalStageInitPlan:
+    """Startup plan for one logical stage."""
+
+    stage_idx: int
+    configured_stage_id: int
+    replicas: list[ReplicaInitPlan]
 
 
 def _resolve_model_to_local_path(model: str) -> str:
@@ -81,6 +109,14 @@ def terminate_alive_proc(proc, timeout=5):
         proc.join(timeout=timeout)
         if proc.is_alive():
             proc.kill()
+
+
+def patch_generation_config_if_needed(model_config: Any) -> None:
+    """Guard InputProcessor init for models whose config lacks model_type."""
+    try:
+        model_config.try_get_generation_config()
+    except Exception:
+        model_config.try_get_generation_config = lambda: {}
 
 
 def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
@@ -262,20 +298,6 @@ class StageMetadata:
     replica_id: int = 0
 
 
-@dataclass
-class StartedLlmStage:
-    """Resources for an LLM stage that has completed startup."""
-
-    stage_id: int
-    metadata: Any
-    vllm_config: Any
-    executor_class: type
-    addresses: Any
-    proc: Any = None
-    engine_manager: Any = None
-    coordinator: Any = None
-
-
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     """Pure data extraction from a stage_config object."""
     stage_id: int = stage_config.stage_id
@@ -421,16 +443,36 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
     return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
 
 
+def get_stage_devices_per_replica(stage_cfg: Any) -> int:
+    """Return the number of devices consumed by one replica of *stage_cfg*."""
+    if getattr(stage_cfg, "stage_type", "llm") != "diffusion":
+        return get_stage_tp_size(stage_cfg)
+
+    parallel_config = _get_attr_or_item(getattr(stage_cfg, "engine_args", {}), "parallel_config")
+    if parallel_config is None:
+        return 1
+
+    world_size = _get_attr_or_item(parallel_config, "world_size")
+    if world_size is not None:
+        return max(1, int(world_size))
+
+    try:
+        from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+        return max(1, int(DiffusionParallelConfig.from_dict(_to_dict(parallel_config)).world_size))
+    except Exception:
+        return 1
+
+
 def compute_replica_layout(
     stage_configs: Sequence[Any],
-) -> tuple[list[int], dict[int, list[str]], int]:
+) -> tuple[list[int], dict[int, list[str]]]:
     """Compute per-stage replica counts and device assignments.
 
     Returns:
         replicas_per_stage: num_replicas per logical stage.
         replica_devices_map: stage_idx -> per-replica device strings
             (only for stages with num_replicas > 1).
-        total_llm_replicas: total LLM replica count across all stages.
     """
     replicas_per_stage: list[int] = []
     for stage_cfg in stage_configs:
@@ -451,25 +493,22 @@ def compute_replica_layout(
         devices_str = (
             runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
         )
-        tp_size = get_stage_tp_size(stage_cfg)
+        devices_per_replica = get_stage_devices_per_replica(stage_cfg)
         replica_devices_map[stage_id] = split_devices_for_replicas(
             devices_str,
             num_replicas,
-            tp_size,
+            devices_per_replica,
             stage_id,
         )
         logger.info(
-            "[stage_init] Stage %s: %d replicas, tp=%d, devices split: %s",
+            "[stage_init] Stage %s: %d replicas, devices_per_replica=%d, devices split: %s",
             stage_id,
             num_replicas,
-            tp_size,
+            devices_per_replica,
             replica_devices_map[stage_id],
         )
 
-    total_llm_replicas = sum(
-        replicas_per_stage[i] for i, cfg in enumerate(stage_configs) if getattr(cfg, "stage_type", "llm") != "diffusion"
-    )
-    return replicas_per_stage, replica_devices_map, total_llm_replicas
+    return replicas_per_stage, replica_devices_map
 
 
 def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
@@ -554,6 +593,35 @@ def build_vllm_config(
     executor_class = Executor.get_class(vllm_config)
 
     return vllm_config, executor_class
+
+
+def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
+    """Build one output processor per logical LLM stage."""
+
+    metadata = plan.replicas[0].metadata
+    if stage_vllm_config.model_config.skip_tokenizer_init:
+        tokenizer = None
+    else:
+        tokenizer = cached_tokenizer_from_config(
+            model_config=stage_vllm_config.model_config,
+        )
+    return MultimodalOutputProcessor(
+        tokenizer=tokenizer,
+        log_stats=False,
+        engine_core_output_type=metadata.engine_output_type,
+    )
+
+
+def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
+    """Build the shared stage-0 input processor."""
+
+    patch_generation_config_if_needed(stage_vllm_config.model_config)
+    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    input_processor.input_preprocessor = OmniInputPreprocessor(
+        vllm_config=stage_vllm_config,
+        renderer=input_processor.renderer,
+    )
+    return input_processor
 
 
 def acquire_device_locks(
@@ -749,6 +817,7 @@ def build_diffusion_config(
 
 
 def initialize_diffusion_stage(
+    stage_id: int,
     model: str,
     stage_cfg: Any,
     metadata: StageMetadata,
@@ -770,99 +839,14 @@ def initialize_diffusion_stage(
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
+    engine_args = _to_dict(stage_cfg.engine_args)
+    engine_args.pop("stage_id", None)
+    od_config = OmniDiffusionConfig.from_kwargs(
+        stage_id=stage_id,
+        model=model,
+        **engine_args,
+    )
+    if metadata.cfg_kv_collect_func is not None:
+        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
-
-
-def _shutdown_or_close_resource(resource: Any, resource_name: str, stage_id: int) -> None:
-    """vLLM CoreEngineProcManager / coordinators use ``shutdown()``, not ``close()``."""
-    if resource is None:
-        return
-    shutdown = getattr(resource, "shutdown", None)
-    if callable(shutdown):
-        try:
-            shutdown()
-        except Exception as cleanup_error:
-            logger.warning(
-                "[stage_init] Failed to shutdown launched %s for stage %s: %s",
-                resource_name,
-                stage_id,
-                cleanup_error,
-            )
-        return
-    close = getattr(resource, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception as cleanup_error:
-            logger.warning(
-                "[stage_init] Failed to close launched %s for stage %s: %s",
-                resource_name,
-                stage_id,
-                cleanup_error,
-            )
-
-
-def close_started_llm_stage(started: StartedLlmStage) -> None:
-    """Release resources owned by a launched stage that never attached."""
-    if started.proc is not None:
-        try:
-            terminate_alive_proc(started.proc)
-        except Exception as cleanup_error:
-            logger.warning(
-                "[stage_init] Failed to terminate process for stage %s: %s",
-                started.stage_id,
-                cleanup_error,
-            )
-    _shutdown_or_close_resource(started.engine_manager, "engine manager", started.stage_id)
-    _shutdown_or_close_resource(started.coordinator, "coordinator", started.stage_id)
-
-
-def finalize_initialized_stages(
-    stage_clients: list[Any | None],
-    input_processor: InputProcessor | None,
-) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
-    """Validate successful init and build runtime metadata lists."""
-    if any(stage_client is None for stage_client in stage_clients):
-        raise RuntimeError("Stage initialization completed with missing stage clients")
-
-    initialized_stage_clients = [stage_client for stage_client in stage_clients if stage_client is not None]
-    default_sampling_params_list = [stage_client.default_sampling_params for stage_client in initialized_stage_clients]
-    stage_metadata = [
-        {
-            "final_output": stage_client.final_output,
-            "final_output_type": stage_client.final_output_type,
-            "stage_type": stage_client.stage_type,
-        }
-        for stage_client in initialized_stage_clients
-    ]
-
-    if not isinstance(input_processor, InputProcessor):
-        has_llm_stage = any(metadata.get("stage_type") != "diffusion" for metadata in stage_metadata)
-        if has_llm_stage:
-            raise RuntimeError("Failed to initialize stage-0 InputProcessor for LLM pipeline")
-
-    return initialized_stage_clients, default_sampling_params_list, stage_metadata
-
-
-def cleanup_failed_stage_initialization(
-    stage_clients: list[Any | None],
-    started_llm_stages: list[StartedLlmStage],
-) -> None:
-    """Shutdown attached stages and close any launched-but-unattached engines."""
-    for cleanup_stage_id, stage_client in reversed(list(enumerate(stage_clients))):
-        if stage_client is None:
-            continue
-        try:
-            stage_client.shutdown()
-        except Exception as cleanup_error:
-            logger.warning(
-                "[stage_init] Failed to shutdown initialized stage %s after init failure: %s",
-                cleanup_stage_id,
-                cleanup_error,
-            )
-
-    for started in reversed(started_llm_stages):
-        if stage_clients[started.stage_id] is not None:
-            continue
-        close_started_llm_stage(started)
