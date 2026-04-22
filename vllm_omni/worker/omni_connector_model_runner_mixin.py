@@ -1537,7 +1537,7 @@ class OmniConnectorModelRunnerMixin:
         payload_data, _size = result
         if not payload_data:
             return False
-        if isinstance(payload_data, dict):
+        if isinstance(payload_data, dict) and bool(payload_data.get("finished")):
             logger.info(
                 "[Stage-%s] recv_chunk_result: req=%s ext=%s key=%s keys=%s finished=%s",
                 self._stage_id,
@@ -1656,7 +1656,9 @@ class OmniConnectorModelRunnerMixin:
                     # async-chunk processors once the request is no longer
                     # resumable.
                     kwargs["is_finished"] = request_finished and not bool(getattr(request, "resumable", False))
-                    if "qwen3_omni" in (self._custom_process_func_path or ""):
+                    if "qwen3_omni" in (self._custom_process_func_path or "") and (
+                        request_finished or kwargs.get("is_finished")
+                    ):
                         prompt_token_ids = getattr(request, "prompt_token_ids", None)
                         output_token_ids = getattr(request, "output_token_ids", None)
                         logger.info(
