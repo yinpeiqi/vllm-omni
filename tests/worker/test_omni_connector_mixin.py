@@ -142,6 +142,42 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
 
         sender.shutdown_omni_connectors()
 
+    def test_send_chunk_masks_segment_finish_for_resumable_request(self):
+        connector = MockConnector(stage_id=0)
+
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_id = 0
+        sender._async_chunk = True
+
+        seen = {}
+
+        def mock_process(transfer_manager, pooling_output, request, is_finished=False):
+            seen["is_finished"] = is_finished
+            return {"data": pooling_output, "finished": is_finished}
+
+        sender._custom_process_func = mock_process
+
+        request = _make_request("req-1", "ext-req-1")
+        request.resumable = True
+        request.is_finished = lambda: True
+        sender._send_single_request(
+            {
+                "stage_id": 0,
+                "next_stage_id": 1,
+                "request_id": "ext-req-1",
+                "request": request,
+                "pooling_output": {"value": 42},
+            }
+        )
+        self.assertFalse(seen["is_finished"])
+
+        sender.shutdown_omni_connectors()
+
     def test_send_chunk_does_not_retry_real_type_error(self):
         connector = MockConnector(stage_id=0)
 

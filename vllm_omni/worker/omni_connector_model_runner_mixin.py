@@ -1631,7 +1631,7 @@ class OmniConnectorModelRunnerMixin:
         request: Any | None,
         pooling_output: Any | None,
     ) -> Any | None:
-        """Run the custom process hook with a best-effort finished kwarg."""
+        """Run the custom process hook with a best-effort terminal-finish kwarg."""
         if self._custom_process_func is None:
             return None
 
@@ -1649,7 +1649,13 @@ class OmniConnectorModelRunnerMixin:
         if callable(is_finished_fn):
             try:
                 if supports_is_finished is not False:
-                    kwargs["is_finished"] = bool(is_finished_fn())
+                    request_finished = bool(is_finished_fn())
+                    # For resumable streaming sessions, request.is_finished()
+                    # can mean "current segment stopped" rather than "entire
+                    # request is terminal". Only propagate terminal finish to
+                    # async-chunk processors once the request is no longer
+                    # resumable.
+                    kwargs["is_finished"] = request_finished and not bool(getattr(request, "resumable", False))
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
 

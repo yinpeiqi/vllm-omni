@@ -92,7 +92,7 @@ def talker2code2wav_async_chunk(
     """CosyVoice3 async_chunk processor: talker token stream -> code2wav chunks."""
     with nullcontext():
         request_id = request.external_req_id
-        finished = bool(is_finished or request.is_finished())
+        finished = bool(is_finished)
 
         connector = getattr(transfer_manager, "connector", None)
         raw_cfg = getattr(connector, "config", {}) or {}

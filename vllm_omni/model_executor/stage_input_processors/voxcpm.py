@@ -84,8 +84,6 @@ def latent2vae_async_chunk(
     # Kept for callback signature compatibility with OmniChunkTransferAdapter.
     _ = transfer_manager
     finished_request = _coerce_finished_flag(is_finished)
-    if callable(getattr(request, "is_finished", None)):
-        finished_request = finished_request or _coerce_finished_flag(request.is_finished())
     if not isinstance(pooling_output, dict):
         if finished_request:
             return {

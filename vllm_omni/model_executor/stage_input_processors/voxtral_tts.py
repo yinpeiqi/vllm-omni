@@ -43,7 +43,7 @@ def generator2tokenizer_async_chunk(
     is_finished: bool = False,
 ) -> dict[str, Any] | None:
     request_id = request.external_req_id
-    finished = bool(is_finished or request.is_finished())
+    finished = bool(is_finished)
 
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)

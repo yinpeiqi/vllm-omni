@@ -135,7 +135,10 @@ def talker2code2wav_async_chunk(
     is_finished: bool = False,
 ) -> dict[str, Any] | None:
     request_id = request.external_req_id
-    finished = bool(is_finished or request.is_finished())
+    # Async-chunk callers already reduce "request finished" to a terminal-only
+    # signal. Do not re-read request.is_finished() here: resumable sessions can
+    # report segment-local stops before the overall request is done.
+    finished = bool(is_finished)
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
         request_payload = {}

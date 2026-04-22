@@ -67,7 +67,7 @@ def slow_ar_to_dac_decoder_async_chunk(
     ``talker2code2wav_async_chunk`` in Qwen3 TTS.
     """
     request_id = request.external_req_id
-    finished = bool(is_finished or request.is_finished())
+    finished = bool(is_finished)
 
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
