@@ -1565,6 +1565,9 @@ class OmniConnectorModelRunnerMixin:
 
             with self._lock:
                 if is_finished:
+                    request = self._pending_load_reqs.get(req_id)
+                    if request is not None and getattr(request, "resumable", None) is not None:
+                        request.resumable = False
                     self._chunk_finished_req_ids.add(req_id)
                     self._chunk_stream_completed.add(req_id)
                 # Local cache (RFC §2.4) — merge, don't replace, so that

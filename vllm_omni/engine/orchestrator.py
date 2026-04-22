@@ -36,7 +36,7 @@ def build_engine_core_request_from_tokens(
     params: SamplingParams | PoolingParams,
     arrival_time: float | None = None,
     model_config: ModelConfig | None = None,
-    resumable: bool = True,
+    resumable: bool = False,
     mm_features: list | None = None,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
@@ -970,6 +970,9 @@ class Orchestrator:
                     prompt=base_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
+                    # Async-chunk downstream stages are long-lived sessions
+                    # that expect future chunks from upstream stages.
+                    resumable=True,
                 )
                 logger.info(
                     "[Orchestrator] async_chunk prewarm req=%s stage-%s prompt_len=%s resumable=%s",

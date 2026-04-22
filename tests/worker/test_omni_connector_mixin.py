@@ -926,6 +926,9 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
 
     def test_rank0_only_polls_connector_for_tp_async_chunk(self):
         host = self._make_host(rank=0)
+        req = _make_request("r1", "ext-r1")
+        req.resumable = True
+        host._pending_load_reqs["r1"] = req
         payload = {
             "code_predictor_codes": [10, 11],
             "left_context_size": 0,
@@ -943,6 +946,28 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertIn("r1", host._finished_load_reqs)
         self.assertIn("r1", host._async_chunk_updated_req_ids)
         self.assertEqual(tp_group.broadcast_inputs, [])
+        host.shutdown_omni_connectors()
+
+    def test_finish_sentinel_marks_async_chunk_session_non_resumable(self):
+        host = self._make_host(rank=0)
+        req = _make_request("r1", "ext-r1")
+        req.resumable = True
+        host._pending_load_reqs["r1"] = req
+        payload = {
+            "code_predictor_codes": [10, 11],
+            "left_context_size": 0,
+            "finished": torch.tensor(True),
+        }
+        host._omni_connector.get.return_value = (payload, 123)
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        self.assertFalse(req.resumable)
+        self.assertIn("r1", host._chunk_finished_req_ids)
+        self.assertIn("r1", host._chunk_stream_completed)
         host.shutdown_omni_connectors()
 
     def test_tp_follower_skips_connector_poll_for_async_chunk(self):
