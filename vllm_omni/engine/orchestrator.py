@@ -328,6 +328,7 @@ class Orchestrator:
         await self._cleanup_request_ids(
             self._cfg_tracker.abort_parents(request_ids),
             abort=True,
+            reason="frontend_abort",
         )
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
@@ -516,19 +517,49 @@ class Orchestrator:
         await self._cleanup_request_ids(
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
+            reason=f"stage_error:stage-{stage_id}",
         )
 
     # ---- Shared helpers ----
 
-    async def _cleanup_request_ids(self, request_ids: list[str], *, abort: bool = False) -> None:
+    async def _cleanup_request_ids(
+        self,
+        request_ids: list[str],
+        *,
+        abort: bool = False,
+        reason: str = "unspecified",
+    ) -> None:
         """Release pool bindings and logical request state for the given ids."""
         if not request_ids:
             return
 
         if abort:
             await self._abort_request_ids(request_ids)
+        bindings_by_request = {
+            request_id: {
+                pool.stage_id: replica_id
+                for pool in self.stage_pools
+                if (replica_id := pool.get_bound_replica_id(request_id)) is not None
+            }
+            for request_id in request_ids
+        }
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
+            req_state = self.request_states.get(request_id)
+            logger.info(
+                "[Orchestrator] cleanup req=%s reason=%s abort=%s final_stage=%s "
+                "stage_submit_ts=%s streaming={enabled=%s, segment_finished=%s, new_prompt_len_snapshot=%s} "
+                "bindings=%s",
+                request_id,
+                reason,
+                abort,
+                None if req_state is None else req_state.final_stage_id,
+                None if req_state is None else dict(sorted(req_state.stage_submit_ts.items())),
+                None if req_state is None else req_state.streaming.enabled,
+                None if req_state is None else req_state.streaming.segment_finished,
+                None if req_state is None else req_state.streaming.new_prompt_len_snapshot,
+                bindings_by_request.get(request_id, {}),
+            )
             self._pd_kv_params.pop(request_id, None)
             self.request_states.pop(request_id, None)
 
@@ -563,7 +594,7 @@ class Orchestrator:
 
         if finished and self._cfg_tracker.is_companion(req_id):
             await self._handle_cfg_companion_ready(req_id)
-            await self._cleanup_request_ids([req_id])
+            await self._cleanup_request_ids([req_id], reason=f"cfg_companion_finished:stage-{stage_id}")
             return
 
         if self.stage_pools[stage_id].final_output:
@@ -628,7 +659,10 @@ class Orchestrator:
                     )
 
         if finished and stage_id == req_state.final_stage_id:
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                reason=f"final_stage_finished:stage-{stage_id}",
+            )
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
