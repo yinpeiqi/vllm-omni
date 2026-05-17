@@ -159,6 +159,10 @@ class OmniCoordinator:
             # Replica liveness changed; request broadcast.
             self._schedule_broadcast()
 
+    def wait_for_shutdown(self) -> None:
+        """Block until close() is called or the process is terminated."""
+        self._stop_event.wait()
+
     def close(self) -> None:
         """Shut down background threads and close all ZMQ sockets."""
         if self._closed:
