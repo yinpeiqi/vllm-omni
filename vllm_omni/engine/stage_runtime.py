@@ -453,31 +453,32 @@ class SingleNodeStageRuntime(StageRuntimeBase):
                     lock_fds = acquire_device_locks(
                         plan.metadata.stage_id, engine_args_dict, stage_init_timeout
                     )
+
+                    # Spawn the engine subprocess while CUDA_VISIBLE_DEVICES is
+                    # still set to this stage's devices. The child process
+                    # inherits the env at proc.start() time.
+                    addresses = get_engine_zmq_addresses(vllm_config)
+                    handshake_address = get_open_zmq_ipc_path()
+                    engines_to_handshake = [CoreEngine(index=0, local=True)]
+
+                    engine_manager = OmniCoreEngineProcManager(
+                        local_engine_count=1,
+                        start_index=0,
+                        local_start_index=0,
+                        vllm_config=vllm_config,
+                        local_client=True,
+                        handshake_address=handshake_address,
+                        executor_class=executor_class,
+                        log_stats=False,
+                        omni_stage_id=plan.metadata.stage_id,
+                        omni_coordinator_address=self._get_coordinator_address(),
+                        omni_replica_base_id=plan.replica_id,
+                    )
                 finally:
                     if previous_visible_devices is None:
                         current_omni_platform.unset_device_control_env_var()
                     else:
                         current_omni_platform.set_device_control_env_var(previous_visible_devices)
-
-            # Use vLLM's launch pattern: allocate addresses, spawn via
-            # OmniCoreEngineProcManager, handshake via wait_for_engine_startup.
-            addresses = get_engine_zmq_addresses(vllm_config)
-            handshake_address = get_open_zmq_ipc_path()
-            engines_to_handshake = [CoreEngine(index=0, local=True)]
-
-            engine_manager = OmniCoreEngineProcManager(
-                local_engine_count=1,
-                start_index=0,
-                local_start_index=0,
-                vllm_config=vllm_config,
-                local_client=True,
-                handshake_address=handshake_address,
-                executor_class=executor_class,
-                log_stats=False,
-                omni_stage_id=plan.metadata.stage_id,
-                omni_coordinator_address=self._get_coordinator_address(),
-                omni_replica_base_id=plan.replica_id,
-            )
 
             with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
                 wait_for_engine_startup(
