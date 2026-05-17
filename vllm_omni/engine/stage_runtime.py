@@ -346,7 +346,12 @@ class SingleNodeStageRuntime(StageRuntimeBase):
         stage_plans: Sequence[LogicalStageInitPlan],
         stage_init_timeout: int,
     ) -> dict[int, list[StagePoolClient | None]]:
-        """Initialize all stage replicas (diffusion inline, LLM parallel)."""
+        """Initialize all stage replicas (diffusion inline, LLM parallel).
+
+        Stages sharing the same GPU are initialized sequentially to avoid
+        memory profiling interference. Stages on different GPUs are
+        initialized in parallel.
+        """
         stage_launch_lock = threading.Lock()
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
@@ -372,29 +377,52 @@ class SingleNodeStageRuntime(StageRuntimeBase):
                 break
 
         if primary_exc is None and llm_replicas:
-            future_to_replica: dict[concurrent.futures.Future[StagePoolClient], tuple[int, int]] = {}
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(llm_replicas)),
-                thread_name_prefix="stage-init",
-            ) as init_executor:
-                for stage_idx, replica in llm_replicas:
-                    future = init_executor.submit(
-                        self._initialize_replica, replica, stage_init_timeout, stage_launch_lock
-                    )
-                    future_to_replica[future] = (stage_idx, replica.replica_id)
+            # Group replicas by device so co-located stages init sequentially.
+            device_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
+            for stage_idx, replica in llm_replicas:
+                runtime_cfg = replica.metadata.runtime_cfg or {}
+                devices_key = str(
+                    runtime_cfg.get("devices") if hasattr(runtime_cfg, "get")
+                    else getattr(runtime_cfg, "devices", None)
+                )
+                device_groups.setdefault(devices_key, []).append((stage_idx, replica))
 
-                for future in concurrent.futures.as_completed(future_to_replica):
-                    stage_idx, replica_id = future_to_replica[future]
+            def _init_device_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
+                """Initialize replicas in a device group sequentially."""
+                nonlocal primary_exc
+                for stage_idx, replica in group:
+                    if primary_exc is not None:
+                        return
                     try:
-                        initialized_clients_by_stage[stage_idx][replica_id] = future.result()
-                    except concurrent.futures.CancelledError:
-                        continue
+                        client = self._initialize_replica(
+                            replica, stage_init_timeout, stage_launch_lock
+                        )
+                        initialized_clients_by_stage[stage_idx][replica.replica_id] = client
                     except Exception as exc:
                         if primary_exc is None:
                             primary_exc = exc
-                            for other_future in future_to_replica:
-                                if other_future is not future:
-                                    other_future.cancel()
+                        return
+
+            if len(device_groups) == 1:
+                # All on same device — just run sequentially
+                _init_device_group(list(device_groups.values())[0])
+            else:
+                # Different devices can init in parallel
+                future_to_group: dict[concurrent.futures.Future[None], str] = {}
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(device_groups),
+                    thread_name_prefix="stage-init",
+                ) as init_executor:
+                    for dev_key, group in device_groups.items():
+                        future = init_executor.submit(_init_device_group, group)
+                        future_to_group[future] = dev_key
+
+                    for future in concurrent.futures.as_completed(future_to_group):
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            if primary_exc is None:
+                                primary_exc = exc
 
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)

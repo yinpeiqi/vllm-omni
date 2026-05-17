@@ -104,25 +104,6 @@ _PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
 _PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
 
 
-@dataclasses.dataclass
-class _StageRemoteFactoryContext:
-    """Per-stage context cached by AsyncOmniEngine for dynamic replica attach.
-
-    Populated once during ``_bootstrap_orchestrator`` from the per-stage
-    init plans. ``_build_remote_replica`` consumes it to construct the
-    right head-side stage client when a headless replica registers.
-    """
-
-    stage_id: int
-    stage_type: str
-    stage_cfg: Any
-    base_metadata: Any
-    # LLM-only fields:
-    vllm_config: Any | None = None
-    executor_class: type | None = None
-    # Diffusion-only fields:
-    diffusion_batch_size: int = 1
-
 
 def _inject_global_id(target: Any, request_id: str) -> None:
     """Inject global_request_id into a prompt dict's additional_information."""
@@ -267,7 +248,6 @@ class AsyncOmniEngine:
         )
         self._omni_master_address: str | None = kwargs.get("omni_master_address")
         self._omni_master_port: int | None = kwargs.get("omni_master_port")
-        self._omni_master_server: OmniMasterServer | None = None
 
         # New omni-coordinator flags. Consumed only in single_stage_mode.
         # ``omni_dp_size_local`` is process-local: each invocation (head and
@@ -279,12 +259,6 @@ class AsyncOmniEngine:
         self._omni_heartbeat_timeout: float = float(kwargs.get("omni_heartbeat_timeout") or 30.0)
         if self._omni_heartbeat_timeout <= 0:
             raise ValueError(f"--omni-heartbeat-timeout must be > 0, got {self._omni_heartbeat_timeout}")
-        # Coordinator runtime (head-distributed only).
-        self._coordinator_runtime: Any | None = None
-        # Per-stage construction context, captured after _initialize_stages
-        # and used by ``_build_remote_replica`` (the RemoteReplicaFactory
-        # passed to Orchestrator) when a headless replica registers.
-        self._stage_remote_factory_contexts: dict[int, _StageRemoteFactoryContext] = {}
 
         if single_stage_mode:
             logger.info(
@@ -1454,19 +1428,11 @@ class AsyncOmniEngine:
             except Exception:
                 pass
 
-        if self._omni_master_server is not None:
+        if hasattr(self, "_runtime") and self._runtime is not None:
             try:
-                self._omni_master_server.stop()
+                self._runtime.shutdown()
             except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during shutdown")
-            self._omni_master_server = None
-
-        if self._coordinator_runtime is not None:
-            try:
-                self._coordinator_runtime.close()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to close OmniCoordinatorRuntime during shutdown")
-            self._coordinator_runtime = None
+                logger.exception("[AsyncOmniEngine] Failed to shutdown StageRuntime")
 
     def _try_shutdown(self, *args, **kwargs) -> None:
         try:

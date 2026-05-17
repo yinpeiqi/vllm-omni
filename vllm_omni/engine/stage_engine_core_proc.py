@@ -7,6 +7,7 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 from typing import Any
