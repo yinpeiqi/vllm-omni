@@ -167,7 +167,7 @@ class Orchestrator:
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
 
-        # Distributed membership (optional, injected by DistributedStageRuntime)
+        # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
 
     async def run(self) -> None:

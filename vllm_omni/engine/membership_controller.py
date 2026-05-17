@@ -35,7 +35,7 @@ RemoteReplicaFactory = Callable[[int, int], Awaitable[Any]]
 class MembershipController:
     """Manages dynamic replica attach/detach for distributed mode.
 
-    Constructed by DistributedStageRuntime and passed to Orchestrator.
+    Constructed by DistStageRuntime and passed to Orchestrator.
     The Orchestrator delegates register/unregister messages here.
     """
 

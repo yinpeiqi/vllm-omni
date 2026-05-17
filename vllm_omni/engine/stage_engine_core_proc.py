@@ -27,7 +27,7 @@ from vllm.v1.engine.utils import (
     SignalCallback,
 )
 
-from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 
 logger = init_logger(__name__)
 
@@ -69,7 +69,7 @@ class StageEngineCoreProc(EngineCoreProc):
         maybe_register_config_serialize_by_value()
 
         engine_core: StageEngineCoreProc | None = None
-        coord_client: OmniCoordClientForStage | None = None
+        coord_client = None
         try:
             # NOTE: previous revisions hardcoded data_parallel_size=1 here
             # (TODO referencing issue #984). The hardcoding has been removed
@@ -99,28 +99,16 @@ class StageEngineCoreProc(EngineCoreProc):
                         "EngineCore handshake did not populate input/output addresses; "
                         "cannot start OmniCoordClientForStage"
                     )
-                coord_client = OmniCoordClientForStage(
+                scheduler = getattr(engine_core, "scheduler", None)
+                if scheduler is None:
+                    raise RuntimeError("EngineCore scheduler is not initialized")
+                coord_client = create_stage_coord_client(
                     coord_zmq_addr=omni_coordinator_address,
                     input_addr=addresses.inputs[0],
                     output_addr=addresses.outputs[0],
                     stage_id=int(omni_stage_id),
+                    queue_length_getter=scheduler.get_num_unfinished_requests,
                 )
-
-                def _refresh_queue_length() -> None:
-                    """Pre-heartbeat hook: refresh queue_length from scheduler."""
-                    scheduler = getattr(engine_core, "scheduler", None)
-                    if scheduler is None:
-                        return
-                    try:
-                        coord_client._queue_length = int(  # type: ignore[union-attr]
-                            scheduler.get_num_unfinished_requests()
-                        )
-                    except Exception:
-                        # Live scheduler stats are best-effort — heartbeats
-                        # must not fail because of a stats lookup error.
-                        pass
-
-                coord_client._on_heartbeat = _refresh_queue_length
 
             def wakeup_engine() -> None:
                 engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
@@ -156,4 +144,3 @@ class StageEngineCoreProc(EngineCoreProc):
                     coord_client.close()
             if engine_core is not None:
                 engine_core.shutdown()
-

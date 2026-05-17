@@ -31,7 +31,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
-from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -39,6 +39,18 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+
+def _send_ready(handshake_address: str) -> None:
+    """Send the READY handshake frame to the parent process."""
+    handshake_ctx = zmq.Context()
+    handshake_socket = handshake_ctx.socket(zmq.DEALER)
+    try:
+        handshake_socket.connect(handshake_address)
+        handshake_socket.send(msgspec.msgpack.encode({"status": "READY"}))
+    finally:
+        handshake_socket.close()
+        handshake_ctx.term()
 
 
 class StageDiffusionProc:
@@ -551,17 +563,11 @@ class StageDiffusionProc:
         signal.signal(signal.SIGINT, signal_handler)
 
         proc = cls(model, od_config)
-        coord_client: OmniCoordClientForStage | None = None
+        coord_client = None
         try:
             proc.initialize()
 
-            # Send READY via handshake socket
-            handshake_ctx = zmq.Context()
-            handshake_socket = handshake_ctx.socket(zmq.DEALER)
-            handshake_socket.connect(handshake_address)
-            handshake_socket.send(msgspec.msgpack.encode({"status": "READY"}))
-            handshake_socket.close()
-            handshake_ctx.term()
+            _send_ready(handshake_address)
 
             # Wire OmniCoordClientForStage *after* READY so that the head
             # has bound its head-side request/response sockets — the
@@ -570,17 +576,13 @@ class StageDiffusionProc:
             if omni_coordinator_address is not None:
                 if omni_stage_id is None:
                     raise ValueError("omni_stage_id must be provided when omni_coordinator_address is set")
-                coord_client = OmniCoordClientForStage(
+                coord_client = create_stage_coord_client(
                     coord_zmq_addr=omni_coordinator_address,
                     input_addr=request_address,
                     output_addr=response_address,
                     stage_id=int(omni_stage_id),
+                    queue_length_getter=lambda: proc.queue_length,
                 )
-
-                def _refresh_queue_length() -> None:
-                    coord_client._queue_length = proc.queue_length  # type: ignore[union-attr]
-
-                coord_client._on_heartbeat = _refresh_queue_length
 
                 logger.info(
                     "StageDiffusionProc registered with OmniCoordinator (stage_id=%d replica_id=%d coord=%s)",

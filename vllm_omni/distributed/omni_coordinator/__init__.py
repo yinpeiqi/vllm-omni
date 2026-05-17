@@ -11,7 +11,10 @@ from .load_balancer import (
 )
 from .messages import ReplicaEvent, ReplicaInfo, ReplicaList, StageStatus
 from .omni_coord_client_for_hub import OmniCoordClientForHub
-from .omni_coord_client_for_stage import OmniCoordClientForStage
+from .omni_coord_client_for_stage import (
+    OmniCoordClientForStage,
+    create_stage_coord_client,
+)
 from .omni_coordinator import OmniCoordinator
 from .runtime import OmniCoordinatorRuntime
 
@@ -23,6 +26,7 @@ __all__ = [
     "ReplicaInfo",
     "ReplicaList",
     "OmniCoordClientForStage",
+    "create_stage_coord_client",
     "OmniCoordClientForHub",
     "Task",
     "LoadBalancer",

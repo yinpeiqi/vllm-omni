@@ -52,7 +52,7 @@ from vllm_omni.engine.serialization import (
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
 from vllm_omni.engine.stage_runtime import (
-    DistributedStageRuntime,
+    DistStageRuntime,
     StageRuntimeInfo,
     create_stage_runtime,
 )
@@ -368,7 +368,7 @@ class AsyncOmniEngine:
 
             # Build membership controller for distributed mode
             membership_controller = None
-            if isinstance(self._runtime, DistributedStageRuntime) and self._runtime.coordinator_pub_address:
+            if isinstance(self._runtime, DistStageRuntime) and self._runtime.coordinator_pub_address:
                 from vllm_omni.engine.membership_controller import MembershipController
 
                 membership_controller = MembershipController(
