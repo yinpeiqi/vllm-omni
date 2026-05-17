@@ -103,6 +103,11 @@ def _normalize_task_and_bot_task(
     bot_task: str | None | _DefaultBotTask,
 ) -> tuple[str, str | None]:
     bot_task_was_omitted = bot_task is _DEFAULT_BOT_TASK
+    if isinstance(bot_task, str) and bot_task in _LEGACY_COMPOSITE_TASKS:
+        _, legacy_bot_task, _ = _TASK_PRESETS[bot_task]
+        alias_base_task = bot_task.split("_", 1)[0]
+        if task == alias_base_task:
+            bot_task = legacy_bot_task
     if task in _TASK_PRESETS:
         _, legacy_bot_task, _ = _TASK_PRESETS[task]
         base_task = task.split("_", 1)[0]
