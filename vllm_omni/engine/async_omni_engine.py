@@ -295,7 +295,6 @@ class AsyncOmniEngine:
             )
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
-        self._validate_single_stage_mode_replica_constraints()
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -369,15 +368,15 @@ class AsyncOmniEngine:
         self._runtime.initialize()
 
         self.num_stages = len(self.stage_configs)
-        self.stage_pools = self._runtime.get_stage_pools()
-        self.input_processor = self._runtime.get_input_processor()
+        self.stage_pools = self._runtime.stage_pools
+        self.input_processor = self._runtime.input_processor
         self.prompt_expand_func = self._runtime.prompt_expand_func
-        self.stage_clients = self._runtime.get_stage_clients()
-        self.stage_vllm_configs = self._runtime.get_stage_vllm_configs()
-        self.output_processors = self._runtime.get_output_processors()
-        self.default_sampling_params_list = self._runtime.get_default_sampling_params_list()
-        self.stage_metadata = self._runtime.get_stage_metadata()
-        self.supported_tasks = self._runtime.get_supported_tasks()
+        self.stage_clients = self._runtime.stage_clients
+        self.stage_vllm_configs = self._runtime.stage_vllm_configs
+        self.output_processors = self._runtime.output_processors
+        self.default_sampling_params_list = self._runtime.default_sampling_params_list
+        self.stage_metadata = self._runtime.stage_metadata
+        self.supported_tasks = self._runtime.supported_tasks
 
     def _bootstrap_orchestrator(
         self,

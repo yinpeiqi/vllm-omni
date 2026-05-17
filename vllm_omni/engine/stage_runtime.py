@@ -138,48 +138,40 @@ def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
 
 
 class StageRuntimeBase(ABC):
-    """Owns the lifecycle of stage processes and produces StagePool instances."""
+    """Owns the lifecycle of stage processes and produces StagePool instances.
+
+    After initialize() completes, the following attributes are populated:
+    - stage_pools, input_processor, stage_metadata, default_sampling_params_list
+    - stage_clients, stage_vllm_configs, output_processors, supported_tasks
+    - prompt_expand_func
+    """
+
+    stage_pools: list[StagePool]
+    input_processor: InputProcessor | None
+    stage_metadata: list[StageRuntimeInfo]
+    default_sampling_params_list: list[OmniSamplingParams]
+    prompt_expand_func: Any
+    supported_tasks: tuple[str, ...]
 
     @abstractmethod
-    def get_stage_pools(self) -> list[StagePool]:
-        ...
-
-    @abstractmethod
-    def get_input_processor(self) -> InputProcessor | None:
-        ...
-
-    @abstractmethod
-    def get_stage_metadata(self) -> list[StageRuntimeInfo]:
-        ...
-
-    @abstractmethod
-    def get_default_sampling_params_list(self) -> list[OmniSamplingParams]:
-        ...
-
-    @abstractmethod
-    def get_stage_clients(self) -> list[StageClient]:
-        ...
-
-    @abstractmethod
-    def get_stage_vllm_configs(self) -> list[Any]:
-        ...
-
-    @abstractmethod
-    def get_output_processors(self) -> list[Any]:
-        ...
-
-    @abstractmethod
-    def get_supported_tasks(self) -> tuple[str, ...]:
-        ...
-
-    @property
-    @abstractmethod
-    def prompt_expand_func(self) -> Any:
+    def initialize(self) -> None:
         ...
 
     @abstractmethod
     def shutdown(self) -> None:
         ...
+
+    @property
+    def stage_clients(self) -> list[StageClient]:
+        return [cast(StageClient, pool.stage_client) for pool in self.stage_pools]
+
+    @property
+    def stage_vllm_configs(self) -> list[Any]:
+        return [pool.stage_vllm_config for pool in self.stage_pools]
+
+    @property
+    def output_processors(self) -> list[Any]:
+        return [pool.output_processor for pool in self.stage_pools]
 
 
 # ===========================================================================
@@ -215,12 +207,12 @@ class SingleNodeStageRuntime(StageRuntimeBase):
         self._num_stages = len(stage_configs)
 
         # Populated by initialize()
-        self._stage_pools: list[StagePool] = []
-        self._input_processor: InputProcessor | None = None
-        self._stage_metadata: list[StageRuntimeInfo] = []
-        self._default_sampling_params_list: list[OmniSamplingParams] = []
-        self._prompt_expand_func: Any = None
-        self._supported_tasks: tuple[str, ...] = ("generate",)
+        self.stage_pools: list[StagePool] = []
+        self.input_processor: InputProcessor | None = None
+        self.stage_metadata: list[StageRuntimeInfo] = []
+        self.default_sampling_params_list: list[OmniSamplingParams] = []
+        self.prompt_expand_func: Any = None
+        self.supported_tasks: tuple[str, ...] = ("generate",)
 
     def initialize(self) -> None:
         """Run the full stage initialization sequence."""
@@ -228,59 +220,28 @@ class SingleNodeStageRuntime(StageRuntimeBase):
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
 
-        stage_plans, prompt_expand_func = self._build_logical_stage_init_plans(
+        stage_plans, self.prompt_expand_func = self._build_logical_stage_init_plans(
             omni_transfer_config, replicas_per_stage, replica_devices_map
         )
-        self._prompt_expand_func = prompt_expand_func
 
         initialized_clients = self._initialize_stage_replicas(stage_plans, self._stage_init_timeout)
 
         if stage_plans and stage_plans[0].replicas[0].metadata.stage_type != "diffusion":
             stage0_vllm_config = stage_plans[0].replicas[0].stage_vllm_config
             assert stage0_vllm_config is not None
-            self._input_processor = build_stage0_input_processor(stage0_vllm_config)
+            self.input_processor = build_stage0_input_processor(stage0_vllm_config)
 
-        self._stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
+        self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
         self._derive_metadata()
 
-    # ---- StageRuntimeBase interface ----
-
-    def get_stage_pools(self) -> list[StagePool]:
-        return self._stage_pools
-
-    def get_input_processor(self) -> InputProcessor | None:
-        return self._input_processor
-
-    def get_stage_metadata(self) -> list[StageRuntimeInfo]:
-        return self._stage_metadata
-
-    def get_default_sampling_params_list(self) -> list[OmniSamplingParams]:
-        return self._default_sampling_params_list
-
-    def get_stage_clients(self) -> list[StageClient]:
-        return [cast(StageClient, pool.stage_client) for pool in self._stage_pools]
-
-    def get_stage_vllm_configs(self) -> list[Any]:
-        return [pool.stage_vllm_config for pool in self._stage_pools]
-
-    def get_output_processors(self) -> list[Any]:
-        return [pool.output_processor for pool in self._stage_pools]
-
-    def get_supported_tasks(self) -> tuple[str, ...]:
-        return self._supported_tasks
-
-    @property
-    def prompt_expand_func(self) -> Any:
-        return self._prompt_expand_func
-
     def shutdown(self) -> None:
-        for pool in self._stage_pools:
+        for pool in self.stage_pools:
             for client in pool.clients:
                 if client is not None and hasattr(client, "shutdown"):
                     try:
                         client.shutdown()
                     except Exception:
-                        logger.warning("[SingleNodeStageRuntime] client shutdown failed", exc_info=True)
+                        logger.warning("[StageRuntime] client shutdown failed", exc_info=True)
 
     # ---- Internal methods (moved from AsyncOmniEngine) ----
 
@@ -675,7 +636,7 @@ class SingleNodeStageRuntime(StageRuntimeBase):
         sampling_params_list: list[OmniSamplingParams] = []
         supported_tasks: set[str] = set()
 
-        for pool in self._stage_pools:
+        for pool in self.stage_pools:
             client = pool.stage_client
             if client is None:
                 continue
@@ -694,9 +655,9 @@ class SingleNodeStageRuntime(StageRuntimeBase):
             if m.final_output_type == "audio":
                 supported_tasks.add("speech")
 
-        self._stage_metadata = metadata_list
-        self._default_sampling_params_list = sampling_params_list
-        self._supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+        self.stage_metadata = metadata_list
+        self.default_sampling_params_list = sampling_params_list
+        self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
 
 # ===========================================================================
@@ -782,7 +743,7 @@ class DistributedStageRuntime(SingleNodeStageRuntime):
         stage_plans, prompt_expand_func = self._build_logical_stage_init_plans(
             omni_transfer_config, replicas_per_stage, replica_devices_map
         )
-        self._prompt_expand_func = prompt_expand_func
+        self.prompt_expand_func = prompt_expand_func
 
         # Capture factory contexts and start distributed infrastructure
         self._stage_remote_factory_contexts = self._capture_stage_factory_contexts(stage_plans)
@@ -794,9 +755,9 @@ class DistributedStageRuntime(SingleNodeStageRuntime):
             if stage_plans and stage_plans[0].replicas[0].metadata.stage_type != "diffusion":
                 stage0_vllm_config = stage_plans[0].replicas[0].stage_vllm_config
                 assert stage0_vllm_config is not None
-                self._input_processor = build_stage0_input_processor(stage0_vllm_config)
+                self.input_processor = build_stage0_input_processor(stage0_vllm_config)
 
-            self._stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
+            self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
             self._derive_metadata()
         except Exception:
             self._cleanup_distributed_infra()

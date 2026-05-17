@@ -19,6 +19,7 @@ from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
 )
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.utils import (
     EngineZmqAddresses,

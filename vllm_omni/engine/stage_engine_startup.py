@@ -13,7 +13,7 @@ from typing import Any
 import msgspec
 import zmq
 from omegaconf import OmegaConf
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
@@ -21,8 +21,6 @@ from vllm.v1.engine.utils import (
     STARTUP_POLL_PERIOD_MS,
     CoreEngine,
     CoreEngineProcManager,
-    CoreEngineState,
-    EngineHandshakeMetadata,
     EngineZmqAddresses,
     wait_for_engine_startup,
 )
@@ -728,70 +726,6 @@ def register_stage_with_omni_master(
     return handshake_address
 
 
-def _wait_for_omni_engine_startup(
-    handshake_socket: zmq.Socket,
-    engine_addresses: EngineZmqAddresses,
-    engines: list[CoreEngine],
-    cache_config: CacheConfig,
-) -> None:
-    """Wait for omni-managed engines to finish the HELLO/READY handshake."""
-    conn_pending = len(engines)
-    start_pending = 0
-
-    poller = zmq.Poller()
-    poller.register(handshake_socket, zmq.POLLIN)
-
-    while conn_pending or start_pending:
-        events = poller.poll(STARTUP_POLL_PERIOD_MS)
-        if not events:
-            logger.debug(
-                "[omni] Waiting for %d engine(s) to connect, %d to start.",
-                conn_pending,
-                start_pending,
-            )
-            continue
-
-        eng_identity, msg_bytes = handshake_socket.recv_multipart()
-        eng_index = int.from_bytes(eng_identity, "little")
-        engine = next((e for e in engines if e.identity == eng_identity), None)
-        if engine is None:
-            raise RuntimeError(f"[omni] Handshake message from unexpected engine rank: {eng_index}")
-
-        msg = msgspec.msgpack.decode(msg_bytes)
-        status: str = msg["status"]
-
-        if status == "HELLO" and engine.state == CoreEngineState.NEW:
-            init_message = msgspec.msgpack.encode(
-                EngineHandshakeMetadata(addresses=engine_addresses, parallel_config={})
-            )
-            handshake_socket.send_multipart((eng_identity, init_message), copy=False)
-            conn_pending -= 1
-            start_pending += 1
-            engine.state = CoreEngineState.CONNECTED
-            logger.debug("[omni] HELLO from engine %d", eng_index)
-
-        elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
-            # Upstream vllm >=0.19 dropped `num_gpu_blocks` from the READY
-            # handshake payload (the field is now communicated out-of-band via
-            # stats/health topics); tolerate both legacy and new message
-            # shapes so the omni handshake keeps working across rebases.
-            reported_blocks = msg.get("num_gpu_blocks")
-            if reported_blocks is not None:
-                cache_config.num_gpu_blocks = (cache_config.num_gpu_blocks or 0) + int(reported_blocks)
-            if engine_addresses.frontend_stats_publish_address is None:
-                engine_addresses.frontend_stats_publish_address = msg.get("dp_stats_address")
-            start_pending -= 1
-            engine.state = CoreEngineState.READY
-            logger.debug(
-                "[omni] READY from engine %d (num_gpu_blocks=%s)",
-                eng_index,
-                "unknown" if reported_blocks is None else reported_blocks,
-            )
-
-        else:
-            raise RuntimeError(f"[omni] Unexpected status '{status}' from engine {eng_index} in state {engine.state}.")
-
-
 @contextlib.contextmanager
 def connect_remote_engine_cores(
     vllm_config: VllmConfig,
@@ -833,11 +767,15 @@ def connect_remote_engine_cores(
     with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
         yield None, coordinator, addresses, None
 
-        _wait_for_omni_engine_startup(
+        wait_for_engine_startup(
             handshake_socket,
             addresses,
             engines_to_handshake,
+            vllm_config.parallel_config,
+            False,  # coordinated_dp
             vllm_config.cache_config,
+            None,  # proc_manager (remote — no local procs)
+            None,  # coord_process
         )
 
 
