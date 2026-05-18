@@ -817,11 +817,15 @@ class DistStageRuntime(StageRuntime):
             vllm_config,
         )
         logger.info("[DistStageRuntime] Stage %s remote engine startup completed", plan.metadata.stage_id)
+        client_addresses = self._client_addresses_from_zmq(addresses)
+        replica_host = self._omni_master_server.get_replica_host(plan.metadata.stage_id, plan.replica_id)
+        if replica_host:
+            client_addresses["replica_host"] = replica_host
         return StageEngineCoreClientBase.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=executor_class,
             metadata=plan.metadata,
-            client_addresses=self._client_addresses_from_zmq(addresses),
+            client_addresses=client_addresses,
             engine_manager=engine_manager,
             coordinator=coordinator,
         )
@@ -1000,11 +1004,15 @@ class DistStageRuntime(StageRuntime):
         )
         metadata = copy.deepcopy(ctx.base_metadata)
         metadata.replica_id = replica_id
+        client_addresses = self._client_addresses_from_zmq(addresses)
+        replica_host = self._omni_master_server.get_replica_host(stage_id, replica_id)
+        if replica_host:
+            client_addresses["replica_host"] = replica_host
         return StageEngineCoreClientBase.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=ctx.executor_class,
             metadata=metadata,
-            client_addresses=self._client_addresses_from_zmq(addresses),
+            client_addresses=client_addresses,
             engine_manager=engine_manager,
             coordinator=coordinator,
         )

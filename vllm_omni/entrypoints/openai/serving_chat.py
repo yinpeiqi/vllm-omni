@@ -2361,6 +2361,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             default_params_list,
             diffusion_params=gen_params,
         )
+
+        if bot_task is not None or sys_type is not None or custom_system_prompt is not None:
+            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_stop_token_ids
+
+            task = "it2i" if reference_images else "t2i"
+            effective_bot_task = bot_task if bot_task is not None or "bot_task" not in extra_body else None
+            if comprehension_idx is not None:
+                stop_token_ids = resolve_stop_token_ids(
+                    task=task,
+                    bot_task=effective_bot_task,
+                )
+                sampling_params_list[comprehension_idx].stop_token_ids = stop_token_ids
+                logger.info(
+                    "[ServingChat] multistage req task=%s bot_task=%s comprehension_stage=%s stop_token_ids=%s",
+                    task,
+                    effective_bot_task,
+                    comprehension_idx,
+                    stop_token_ids,
+                )
         for idx, stage_cfg in enumerate(stage_configs):
             stage_type = get_stage_type(stage_cfg)
             default_stage_params = sampling_params_list[idx]

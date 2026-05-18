@@ -438,6 +438,9 @@ class StageDeployConfig:
     load_format: str | None = None
     tokenizer_mode: str | None = None
 
+    # Omni stage role: marks the AR/comprehension stage for stop-token injection.
+    is_comprehension: bool | None = None
+
     # Pass-through vLLM EngineArgs fields that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
@@ -894,7 +897,7 @@ def merge_pipeline_deploy(
                 worker_type=worker_type,
                 scheduler_cls=_scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
-                is_comprehension=ps.owns_tokenizer,
+                is_comprehension=getattr(ds, "is_comprehension", None) or ps.owns_tokenizer,
                 yaml_engine_args=engine_args,
                 yaml_runtime=runtime,
                 yaml_extras=extras,

@@ -93,6 +93,11 @@ class StageAllocation:
     # Output channel: client binds PULL, engine connects PUSH
     output_bind_address: str
     output_connect_address: str
+    # The replica's routable IP (from registration). For LLM remote replicas
+    # the ZMQ sockets are bound on the head, but the KV connector runs on
+    # the replica host — this field preserves the replica's actual IP so the
+    # orchestrator can advertise the correct KV sender endpoint.
+    replica_host: str | None = None
 
 
 @dataclass(frozen=True)
@@ -336,6 +341,13 @@ class OmniMasterServer:
             outputs=[alloc.output_connect_address],
         )
 
+    def get_replica_host(self, stage_id: int, replica_id: int = 0) -> str | None:
+        """Return the replica's routable IP if it registered one."""
+        alloc = self._stage_routes.get((stage_id, replica_id))
+        if alloc is None:
+            return None
+        return alloc.replica_host
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -517,8 +529,13 @@ class OmniMasterServer:
                         input_connect_address=inp_bind_addr,
                         output_bind_address=out_bind_addr,
                         output_connect_address=out_bind_addr,
+                        replica_host=new_bind_address,
                     )
                     self._stage_routes[(stage_id, replica_id)] = alloc
+                else:
+                    # LLM remote replica: ZMQ sockets stay on the master,
+                    # but record the replica's IP for KV connector routing.
+                    alloc.replica_host = new_bind_address
                 logger.info(
                     "[OmniMasterServer] Stage %d replica %d cross-host bind "
                     "(sockets bound on %s; replica_ip=%s)",
