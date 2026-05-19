@@ -17,33 +17,22 @@ from typing import Any
 from vllm_omni.distributed.omni_coordinator.omni_coordinator import OmniCoordinator
 
 
-class OmniCoordinatorProc:
-    """Process entry point for the OmniCoordinator service."""
+def run_omni_coordinator_proc(
+    router_zmq_addr: str,
+    pub_zmq_addr: str,
+    heartbeat_timeout: float,
+    ready_pipe: Any,
+) -> None:
+    """Main loop running inside the coordinator child process."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    @staticmethod
-    def run(
-        router_zmq_addr: str,
-        pub_zmq_addr: str,
-        heartbeat_timeout: float,
-        ready_pipe: Any,
-    ) -> None:
-        """Main loop running inside the child process.
+    coordinator = OmniCoordinator(
+        router_zmq_addr=router_zmq_addr,
+        pub_zmq_addr=pub_zmq_addr,
+        heartbeat_timeout=heartbeat_timeout,
+    )
 
-        Args:
-            router_zmq_addr: Pre-allocated ROUTER bind address.
-            pub_zmq_addr: Pre-allocated PUB bind address.
-            heartbeat_timeout: Seconds before a replica is considered dead.
-            ready_pipe: multiprocessing.Connection to signal readiness.
-        """
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ready_pipe.send("ready")
+    ready_pipe.close()
 
-        coordinator = OmniCoordinator(
-            router_zmq_addr=router_zmq_addr,
-            pub_zmq_addr=pub_zmq_addr,
-            heartbeat_timeout=heartbeat_timeout,
-        )
-
-        ready_pipe.send("ready")
-        ready_pipe.close()
-
-        coordinator.wait_for_shutdown()
+    coordinator.wait_for_shutdown()

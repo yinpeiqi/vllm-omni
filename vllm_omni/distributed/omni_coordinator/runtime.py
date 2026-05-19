@@ -81,10 +81,10 @@ class OmniCoordinatorRuntime:
         ctx = _get_coordinator_mp_context()
         parent_conn, child_conn = ctx.Pipe(duplex=False)
 
-        from .omni_coordinator_proc import OmniCoordinatorProc
+        from .omni_coordinator_proc import run_omni_coordinator_proc
 
         self._proc: multiprocessing.Process = ctx.Process(
-            target=OmniCoordinatorProc.run,
+            target=run_omni_coordinator_proc,
             kwargs={
                 "router_zmq_addr": self.router_address,
                 "pub_zmq_addr": self.pub_address,

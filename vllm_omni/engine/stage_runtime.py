@@ -724,7 +724,6 @@ class DistStageRuntime(StageRuntime):
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
         self._omni_master_port = omni_master_port
-        self._omni_dp_size_local = omni_dp_size_local
         self._omni_heartbeat_timeout = omni_heartbeat_timeout
         self._omni_lb_policy = omni_lb_policy
         self._request_queue = request_queue
@@ -748,9 +747,6 @@ class DistStageRuntime(StageRuntime):
         if self._coordinator_runtime is not None:
             return self._build_remote_replica
         return None
-
-    def set_request_queue(self, queue: janus.Queue[EngineQueueMessage]) -> None:
-        self._request_queue = queue
 
     def initialize(self) -> None:
         """Run the full distributed stage initialization sequence."""

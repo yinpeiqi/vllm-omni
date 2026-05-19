@@ -6,6 +6,7 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import signal
@@ -45,6 +46,47 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+
+@contextlib.contextmanager
+def _replica_device_env(stage_id: int, devices: str | None):
+    """Temporarily scope device visibility for one replica launch."""
+    from vllm_omni.platforms import current_omni_platform
+
+    device_control_env = current_omni_platform.device_control_env_var
+    previous_visible_devices = os.environ.get(device_control_env)
+    try:
+        if devices is not None:
+            from vllm_omni.engine.stage_init_utils import setup_stage_devices
+
+            setup_stage_devices(stage_id, {"devices": devices})
+        yield
+    finally:
+        if previous_visible_devices is None:
+            current_omni_platform.unset_device_control_env_var()
+        else:
+            current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+
+def _wait_for_manager_liveness(engine_managers: list[Any]) -> None:
+    """Block until one or more engine managers report process exit."""
+    if len(engine_managers) == 1:
+        engine_managers[0].monitor_engine_liveness()
+        return
+
+    def _monitor_target(mgr: Any) -> None:
+        try:
+            mgr.monitor_engine_liveness()
+        except Exception:
+            logger.exception("[Headless] monitor_engine_liveness raised")
+
+    monitor_threads: list[threading.Thread] = []
+    for mgr in engine_managers:
+        t = threading.Thread(target=_monitor_target, args=(mgr,), name=f"omni-replica-monitor-{id(mgr):x}")
+        t.start()
+        monitor_threads.append(t)
+    for t in monitor_threads:
+        t.join()
 
 
 def _ensure_vllm_platform():
@@ -771,8 +813,6 @@ def run_headless(args: argparse.Namespace) -> None:
         )
     else:
         per_replica_devices = [None] * omni_dp_size_local
-    device_control_env = current_omni_platform.device_control_env_var
-
     if stage_cfg.stage_type == "diffusion":
         metadata = extract_stage_metadata(stage_cfg)
         if omni_conn_cfg:
@@ -808,10 +848,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 # field is set). The spawned subprocess inherits the env at
                 # spawn time; we restore the parent env afterwards so the
                 # next replica's setup sees the same baseline.
-                previous_visible_devices = os.environ.get(device_control_env)
-                try:
-                    if per_replica_devices[_rep_idx] is not None:
-                        setup_stage_devices(stage_id, {"devices": per_replica_devices[_rep_idx]})
+                with _replica_device_env(stage_id, per_replica_devices[_rep_idx]):
                     # Each StageDiffusionProc starts its own
                     # torch.distributed group bound to
                     # ``od_config.master_port``. Without an explicit
@@ -845,11 +882,6 @@ def run_headless(args: argparse.Namespace) -> None:
                         omni_stage_id=stage_id,
                         omni_replica_id=response.replica_id,
                     )
-                finally:
-                    if previous_visible_devices is None:
-                        current_omni_platform.unset_device_control_env_var()
-                    else:
-                        current_omni_platform.set_device_control_env_var(previous_visible_devices)
                 complete_diffusion_handshake(proc, response.handshake_address, args.stage_init_timeout)
                 procs.append(proc)
                 logger.info(
@@ -983,14 +1015,6 @@ def run_headless(args: argparse.Namespace) -> None:
         log_stats = False
 
     engine_managers: list[Any] = []
-    monitor_threads: list[threading.Thread] = []
-
-    def _monitor_target(mgr: Any) -> None:
-        try:
-            mgr.monitor_engine_liveness()
-        except Exception:
-            logger.exception("[Headless] monitor_engine_liveness raised")
-
     try:
         for _rep_idx in range(omni_dp_size_local):
             # Always auto-assign: see the diffusion branch comment above
@@ -1020,10 +1044,7 @@ def run_headless(args: argparse.Namespace) -> None:
             # branch above. OmniCoreEngineProcManager.__init__ spawns its
             # subprocesses via context.Process inside the constructor, so we
             # must set the env *before* instantiation and restore after.
-            previous_visible_devices = os.environ.get(device_control_env)
-            try:
-                if per_replica_devices[_rep_idx] is not None:
-                    setup_stage_devices(stage_id, {"devices": per_replica_devices[_rep_idx]})
+            with _replica_device_env(stage_id, per_replica_devices[_rep_idx]):
                 mgr = OmniCoreEngineProcManager(
                     local_engine_count=local_engine_count,
                     start_index=dp_rank,
@@ -1037,11 +1058,6 @@ def run_headless(args: argparse.Namespace) -> None:
                     omni_coordinator_address=response.coordinator_router_address,
                     omni_replica_base_id=response.replica_id,
                 )
-            finally:
-                if previous_visible_devices is None:
-                    current_omni_platform.unset_device_control_env_var()
-                else:
-                    current_omni_platform.set_device_control_env_var(previous_visible_devices)
             engine_managers.append(mgr)
             logger.info(
                 "[Headless] Stage %d replica id=%d up (coord=%s)",
@@ -1050,17 +1066,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 response.coordinator_router_address,
             )
 
-        # Run all managers' liveness monitors in parallel. Each blocks
-        # until its own subprocesses exit (or fail).
-        if len(engine_managers) == 1:
-            engine_managers[0].monitor_engine_liveness()
-        else:
-            for mgr in engine_managers:
-                t = threading.Thread(target=_monitor_target, args=(mgr,), name=f"omni-replica-monitor-{id(mgr):x}")
-                t.start()
-                monitor_threads.append(t)
-            for t in monitor_threads:
-                t.join()
+        _wait_for_manager_liveness(engine_managers)
     finally:
         logger.info("[Headless] Shutting down stage %d (%d managers).", stage_id, len(engine_managers))
         for mgr in engine_managers:

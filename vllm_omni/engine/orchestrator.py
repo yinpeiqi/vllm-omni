@@ -183,6 +183,10 @@ class Orchestrator:
         # Start membership watcher if distributed mode is active.
         membership_watcher: asyncio.Task[None] | None = None
         if self._membership is not None:
+            self._membership.install_unregister_handlers(
+                output_queue=self.output_async_queue,
+                cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+            )
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
@@ -250,13 +254,9 @@ class Orchestrator:
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
-            elif isinstance(msg, UnregisterRemoteReplicaMessage):
+            elif msg_type == "unregister_remote_replica":
                 if self._membership is not None:
-                    await self._membership.handle_unregister(
-                        msg.stage_id, msg.input_addr,
-                        output_queue=self.output_async_queue,
-                        cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
-                    )
+                    await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
             elif msg_type == "shutdown":
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()

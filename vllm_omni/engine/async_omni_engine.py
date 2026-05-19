@@ -269,6 +269,7 @@ class AsyncOmniEngine:
             )
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+        self._validate_stage_ids_align_with_pipeline_order()
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -1158,6 +1159,22 @@ class AsyncOmniEngine:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 
         return config_path, stage_configs
+
+    def _validate_stage_ids_align_with_pipeline_order(self) -> None:
+        """Enforce the single-identity stage model used by the runtime.
+
+        Orchestrator routing, stage-pool indexing, and distributed membership all
+        assume there is exactly one stage identifier: the pipeline position.
+        Keep that invariant explicit instead of relying on implicit equality
+        between config ``stage_id`` and list index.
+        """
+        for idx, cfg in enumerate(self.stage_configs):
+            cfg_stage_id = getattr(cfg, "stage_id", None)
+            if cfg_stage_id != idx:
+                raise ValueError(
+                    "stage_configs must use contiguous stage_id values matching "
+                    f"pipeline order; expected stage_id={idx} at index {idx}, got {cfg_stage_id!r}"
+                )
 
     # ==================== Public API ====================
 

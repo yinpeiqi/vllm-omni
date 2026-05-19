@@ -12,7 +12,6 @@ clients via an injected factory and mutating StagePool membership.
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -20,7 +19,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
-    RandomBalancer,
 )
 from vllm_omni.distributed.omni_coordinator.messages import StageStatus
 from vllm_omni.distributed.omni_coordinator.omni_coord_client_for_hub import OmniCoordClientForHub
@@ -40,7 +38,6 @@ class MembershipController:
     """
 
     WATCH_INTERVAL_S: float = 0.5
-    WATCH_IDLE_INTERVAL_S: float = 1.0
 
     def __init__(
         self,
@@ -54,6 +51,8 @@ class MembershipController:
         self._membership_tasks: set[asyncio.Task[None]] = set()
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
+        self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
+        self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
 
         self._hub = OmniCoordClientForHub(coordinator_pub_address)
         factory = load_balancer_factory
@@ -83,16 +82,20 @@ class MembershipController:
         cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None,
     ) -> None:
         """Handle an unregister_remote_replica message."""
-        if not (0 <= stage_id < len(self._stage_pools)):
+        pool = self._pool_for_stage_id(stage_id)
+        if pool is None:
             return
-        pool = self._stage_pools[stage_id]
+        effective_output_queue = output_queue if output_queue is not None else self._output_queue
+        effective_cleanup_callback = (
+            cleanup_callback if cleanup_callback is not None else self._cleanup_callback
+        )
         affected = pool.invalidate_addr(input_addr)
         self._detach_replica(stage_id, input_addr)
-        if affected and cleanup_callback is not None:
-            await cleanup_callback(affected)
-        if affected and output_queue is not None:
+        if affected and effective_cleanup_callback is not None:
+            await effective_cleanup_callback(affected)
+        if affected and effective_output_queue is not None:
             for req_id in affected:
-                await output_queue.put(
+                await effective_output_queue.put(
                     ErrorMessage(error="stage replica disappeared", request_id=req_id, stage_id=stage_id)
                 )
 
@@ -139,7 +142,7 @@ class MembershipController:
                 }
                 for stage_id, addr in last_up - current:
                     self._spawn_task(
-                        self._do_unregister(stage_id, addr),
+                        self.handle_unregister(stage_id, addr),
                         label=f"unregister-s{stage_id}",
                     )
                 last_up = current
@@ -154,13 +157,13 @@ class MembershipController:
                 raise
 
     async def _do_register(self, stage_id: int, replica_id: int) -> None:
-        if not (0 <= stage_id < len(self._stage_pools)):
+        pool = self._pool_for_stage_id(stage_id)
+        if pool is None:
             logger.warning("[MembershipController] register: stage_id %d out of range", stage_id)
             return
         if self._remote_replica_factory is None:
             logger.warning("[MembershipController] register: no factory installed")
             return
-        pool = self._stage_pools[stage_id]
         client = await self._remote_replica_factory(stage_id, replica_id)
         input_addr = StagePool._client_input_addr(client)
         if input_addr is None:
@@ -173,13 +176,10 @@ class MembershipController:
             stage_id, replica_id, input_addr,
         )
 
-    async def _do_unregister(self, stage_id: int, input_addr: str) -> None:
-        if not (0 <= stage_id < len(self._stage_pools)):
-            return
-        self._detach_replica(stage_id, input_addr)
-
     def _detach_replica(self, stage_id: int, input_addr: str) -> None:
-        pool = self._stage_pools[stage_id]
+        pool = self._pool_for_stage_id(stage_id)
+        if pool is None:
+            return
         client = pool.remove_client(input_addr)
         if client is None:
             return
@@ -190,3 +190,18 @@ class MembershipController:
                 "[MembershipController] failed to shutdown client stage=%d addr=%s", stage_id, input_addr
             )
         logger.info("[MembershipController] detached replica stage=%d addr=%s", stage_id, input_addr)
+
+    def install_unregister_handlers(
+        self,
+        *,
+        output_queue: asyncio.Queue[EngineQueueMessage],
+        cleanup_callback: Callable[[list[str]], Awaitable[None]],
+    ) -> None:
+        """Install shared cleanup sinks for watcher-driven unregister events."""
+        self._output_queue = output_queue
+        self._cleanup_callback = cleanup_callback
+
+    def _pool_for_stage_id(self, stage_id: int) -> StagePool | None:
+        if not (0 <= stage_id < len(self._stage_pools)):
+            return None
+        return self._stage_pools[stage_id]
