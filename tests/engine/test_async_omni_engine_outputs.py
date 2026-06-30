@@ -14,12 +14,13 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_engine(ipc_client, mocker: MockerFixture, *, thread_alive: bool = True) -> AsyncOmniEngine:
-    """Create an AsyncOmniEngine bypassing __init__."""
+def _make_engine(ipc_client, mocker: MockerFixture, *, worker_alive: bool = True) -> AsyncOmniEngine:
+    """Create an APIServer-side AsyncOmniEngine bypassing __init__."""
     engine = object.__new__(AsyncOmniEngine)
     engine._ipc_client = ipc_client
-    engine.orchestrator_thread = mocker.MagicMock(
-        is_alive=mocker.MagicMock(return_value=thread_alive),
+    engine._is_orchestrator_worker = False
+    engine._worker_proc = mocker.MagicMock(
+        poll=mocker.MagicMock(return_value=None if worker_alive else 0),
     )
     return engine
 
@@ -38,11 +39,11 @@ def test_try_get_output_raises_after_orchestrator_dies(mocker: MockerFixture):
         None,
     ]
 
-    engine = _make_engine(mock_client, mocker, thread_alive=True)
+    engine = _make_engine(mock_client, mocker, worker_alive=True)
 
     assert engine.try_get_output().request_id == "r1"
 
-    engine.orchestrator_thread.is_alive.return_value = False
+    engine._worker_proc.poll.return_value = 0
 
     with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
         engine.try_get_output()
@@ -62,11 +63,11 @@ async def test_try_get_output_async_raises_after_orchestrator_dies(mocker: Mocke
         None,
     ]
 
-    engine = _make_engine(mock_client, mocker, thread_alive=True)
+    engine = _make_engine(mock_client, mocker, worker_alive=True)
 
     assert (await engine.try_get_output_async()).request_id == "r1"
 
-    engine.orchestrator_thread.is_alive.return_value = False
+    engine._worker_proc.poll.return_value = 0
 
     with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
         await engine.try_get_output_async()
@@ -83,7 +84,7 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
     mock_client = mocker.MagicMock()
     mock_client.recv_output.return_value = fatal_msg
 
-    engine = _make_engine(mock_client, mocker, thread_alive=False)
+    engine = _make_engine(mock_client, mocker, worker_alive=False)
 
     msg = engine.try_get_output()
     assert msg is not None
@@ -100,7 +101,7 @@ async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker:
     mock_client = mocker.MagicMock()
     mock_client.recv_output.return_value = fatal_msg
 
-    engine = _make_engine(mock_client, mocker, thread_alive=False)
+    engine = _make_engine(mock_client, mocker, worker_alive=False)
 
     msg = await engine.try_get_output_async()
     assert msg is not None

@@ -51,7 +51,7 @@ class MembershipController:
         self._membership_tasks: set[asyncio.Task[None]] = set()
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
-        self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
+        self._output_sink: Callable[[EngineQueueMessage], Awaitable[None]] | None = None
         self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
 
         self._hub = OmniCoordClientForHub(coordinator_pub_address)
@@ -72,26 +72,18 @@ class MembershipController:
             label=f"register-s{stage_id}-r{replica_id}",
         )
 
-    async def handle_unregister(
-        self,
-        stage_id: int,
-        input_addr: str,
-        output_queue: asyncio.Queue[EngineQueueMessage] | None = None,
-        cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None,
-    ) -> None:
+    async def handle_unregister(self, stage_id: int, input_addr: str) -> None:
         """Handle an unregister_remote_replica message."""
         pool = self._pool_for_stage_id(stage_id)
         if pool is None:
             return
-        effective_output_queue = output_queue if output_queue is not None else self._output_queue
-        effective_cleanup_callback = cleanup_callback if cleanup_callback is not None else self._cleanup_callback
         affected = pool.invalidate_addr(input_addr)
         self._detach_replica(stage_id, input_addr)
-        if affected and effective_cleanup_callback is not None:
-            await effective_cleanup_callback(affected)
-        if affected and effective_output_queue is not None:
+        if affected and self._cleanup_callback is not None:
+            await self._cleanup_callback(affected)
+        if affected and self._output_sink is not None:
             for req_id in affected:
-                await effective_output_queue.put(
+                await self._output_sink(
                     ErrorMessage(error="stage replica disappeared", request_id=req_id, stage_id=stage_id)
                 )
 
@@ -181,11 +173,11 @@ class MembershipController:
     def install_unregister_handlers(
         self,
         *,
-        output_queue: asyncio.Queue[EngineQueueMessage],
+        output_sink: Callable[[EngineQueueMessage], Awaitable[None]],
         cleanup_callback: Callable[[list[str]], Awaitable[None]],
     ) -> None:
         """Install shared cleanup sinks for watcher-driven unregister events."""
-        self._output_queue = output_queue
+        self._output_sink = output_sink
         self._cleanup_callback = cleanup_callback
 
     def _pool_for_stage_id(self, stage_id: int) -> StagePool | None:

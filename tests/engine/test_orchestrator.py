@@ -1285,7 +1285,7 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
 
 
 @pytest.mark.asyncio
-async def test_drain_replica_once_drains_multiple_batches_until_empty() -> None:
+async def test_drain_replica_drains_multiple_batches_until_empty() -> None:
     poll_calls = 0
 
     class BatchPool:
@@ -1318,7 +1318,7 @@ async def test_drain_replica_once_drains_multiple_batches_until_empty() -> None:
     orchestrator._handle_kv_ready_raw_outputs = _noop_kv_ready
     orchestrator._handle_processed_outputs = _noop_handle_processed
 
-    handled = await orchestrator._drain_replica_once(0, pool, 0)
+    handled = await orchestrator._drain_replica(0, pool, 0)
 
     assert handled is True
     assert poll_calls == 4

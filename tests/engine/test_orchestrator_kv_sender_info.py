@@ -197,17 +197,17 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
     diffusion_pool = StagePool(1, diffusion_stage)
 
-    class _AsyncQueue:
+    class _ZmqStub:
         def __init__(self):
-            self.items = []
+            self.outputs: list[object] = []
 
-        async def put(self, item):
-            self.items.append(item)
+        async def send_output(self, item):
+            self.outputs.append(item)
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator._cfg_tracker = CfgCompanionTracker()
-    orchestrator.output_async_queue = _AsyncQueue()
+    orchestrator._zmq_ipc = _ZmqStub()
     orchestrator.request_states = {}
     orchestrator._pd_kv_params = {}
 
@@ -224,8 +224,8 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-empty", 0, output, req_state))
 
     assert diffusion_stage.calls == []
-    assert len(orchestrator.output_async_queue.items) == 1
-    terminal_msg = orchestrator.output_async_queue.items[0]
+    assert len(orchestrator._zmq_ipc.outputs) == 1
+    terminal_msg = orchestrator._zmq_ipc.outputs[0]
     assert isinstance(terminal_msg, OutputMessage)
     assert terminal_msg.type == "output"
     assert terminal_msg.request_id == "req-empty"

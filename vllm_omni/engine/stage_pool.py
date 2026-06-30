@@ -461,6 +461,10 @@ class StagePool:
             inflight = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)
         return (outputs_qsize, inflight)
 
+    def replica_outputs_queue_size(self, replica_id: int) -> int:
+        """Return the MP client outputs queue depth for drain prioritization."""
+        return self.replica_monitor_sample(replica_id)[0]
+
     def release_binding(self, request_id: str) -> None:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)

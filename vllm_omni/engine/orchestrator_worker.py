@@ -1,4 +1,4 @@
-"""Detached orchestrator worker process (experimental)."""
+"""Orchestrator worker process entrypoint."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ logger = init_logger(__name__)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run orchestrator + stages in a detached process.")
+    parser = argparse.ArgumentParser(description="Run orchestrator and stage workers in a dedicated process.")
     parser.add_argument("--ipc-dir", required=True, help="Directory for ZMQ IPC sockets and init payload.")
     args = parser.parse_args()
 

@@ -1,4 +1,4 @@
-"""Experimental ZMQ IPC between APIServer and a detached orchestrator process."""
+"""ZMQ IPC between APIServer and the orchestrator worker process."""
 
 from __future__ import annotations
 
@@ -41,18 +41,6 @@ def _unpickle_msg(data: bytes) -> EngineQueueMessage:
     return msg
 
 
-class _ZmqOutputQueueAdapter:
-    """Async ``put`` adapter for membership unregister error fan-out."""
-
-    __slots__ = ("_server",)
-
-    def __init__(self, server: OrchestratorZmqServer) -> None:
-        self._server = server
-
-    async def put(self, msg: EngineQueueMessage) -> None:
-        await self._server.send_output(msg)
-
-
 class OrchestratorZmqServer:
     """Worker-side ZMQ endpoints used directly by the orchestrator event loop."""
 
@@ -66,7 +54,6 @@ class OrchestratorZmqServer:
         self._out.bind(self._paths["out"])
         self._rpc = self._ctx.socket(zmq.PUSH)
         self._rpc.bind(self._paths["rpc"])
-        self.output_queue = _ZmqOutputQueueAdapter(self)
         logger.info("[OrchestratorZmqServer] bound on %s", ipc_dir)
 
     async def recv_request(self) -> EngineQueueMessage:
@@ -116,7 +103,7 @@ class OrchestratorZmqSender:
 
 
 class OrchestratorZmqClient:
-    """APIServer-side client for a detached orchestrator worker."""
+    """APIServer-side client for the orchestrator worker."""
 
     def __init__(self, ipc_dir: str) -> None:
         self._ipc_dir = ipc_dir
@@ -198,7 +185,7 @@ def wait_ready(ipc_dir: str, timeout_s: float) -> None:
         if ready.is_file():
             return
         time.sleep(0.2)
-    raise TimeoutError(f"Detached orchestrator did not become ready within {timeout_s}s ({ipc_dir})")
+    raise TimeoutError(f"Orchestrator worker did not become ready within {timeout_s}s ({ipc_dir})")
 
 
 def make_ipc_dir(prefix: str = "vllm_omni_orch_ipc_") -> str:

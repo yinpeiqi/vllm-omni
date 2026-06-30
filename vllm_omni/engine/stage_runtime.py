@@ -14,7 +14,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from collections.abc import Callable
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
@@ -736,7 +735,7 @@ class DistStageRuntime(StageRuntime):
         omni_dp_size_local: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
-        orchestrator_sender: Callable[[EngineQueueMessage], None] | None = None,
+        orchestrator_sender: Callable[[EngineQueueMessage], None],
     ) -> None:
         super().__init__(
             stage_configs=stage_configs,
@@ -938,9 +937,6 @@ class DistStageRuntime(StageRuntime):
 
     def _dispatch_master_register(self, stage_id: int, replica_id: int, alloc: Any) -> None:
         """Callback from OmniMasterServer when a headless replica registers."""
-        if self._orchestrator_sender is None:
-            logger.warning("[DistStageRuntime] on_register fired but no orchestrator_sender wired")
-            return
         try:
             self._orchestrator_sender(
                 RegisterRemoteReplicaMessage(stage_id=stage_id, replica_id=replica_id)
@@ -1079,6 +1075,8 @@ def create_stage_runtime(
     if single_stage_mode:
         if not omni_master_address or not omni_master_port:
             raise ValueError("Distributed mode requires omni_master_address and omni_master_port")
+        if orchestrator_sender is None:
+            raise ValueError("Distributed mode requires orchestrator_sender")
         return DistStageRuntime(
             stage_configs=stage_configs,
             model=model,
