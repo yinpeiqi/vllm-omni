@@ -177,13 +177,25 @@ class AsyncOmni(EngineClient, OmniBase):
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
-        for idx, stage_client in enumerate(self.engine.stage_clients):
-            stage_vllm_config = self.engine.stage_vllm_configs[idx]
-            if stage_vllm_config is None:
+        if self.engine.stage_clients:
+            for idx, stage_client in enumerate(self.engine.stage_clients):
+                stage_vllm_config = self.engine.stage_vllm_configs[idx]
+                if stage_vllm_config is None:
+                    continue
+                if fallback_idx is None:
+                    fallback_idx = idx
+                if stage_client.is_comprehension:
+                    return idx
+            return fallback_idx
+
+        for idx, cfg in enumerate(self.engine.stage_configs):
+            if idx >= len(self.engine.stage_vllm_configs):
+                continue
+            if self.engine.stage_vllm_configs[idx] is None:
                 continue
             if fallback_idx is None:
                 fallback_idx = idx
-            if stage_client.is_comprehension:
+            if getattr(cfg, "is_comprehension", False):
                 return idx
         return fallback_idx
 
@@ -364,6 +376,7 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state = ClientRequestState(
                 request_id=request_id,
                 external_request_id=external_request_id,
+                final_output_stage_ids=set(final_output_stage_ids),
             )
             req_state.metrics = metrics
             req_state.request_arrival_ts = wall_start_ts
@@ -609,6 +622,9 @@ class AsyncOmni(EngineClient, OmniBase):
                 continue
 
             stage_id = result.stage_id
+            requested_stages = req_state.final_output_stage_ids
+            if requested_stages and stage_id not in requested_stages:
+                continue
 
             self._check_engine_output_error(result, request_id, stage_id)
 

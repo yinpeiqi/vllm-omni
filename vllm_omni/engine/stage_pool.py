@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -1053,13 +1054,6 @@ class StagePool:
 
     # ---- Stage-local polling ----
 
-    async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
-        """Pull raw EngineCoreOutputs from a stage replica without processing."""
-        outputs = await client.get_output_async()
-        if not outputs.outputs:
-            return None
-        return outputs
-
     async def process_llm_raw_outputs(
         self,
         replica_id: int,
@@ -1078,9 +1072,6 @@ class StagePool:
             raw_outputs.timestamp,
             iteration_stats,
         )
-        # Use the same wall-clock source as OrchestratorRequestState.stage_submit_ts.
-        # EngineCoreOutputs.timestamp may use a different clock base, which would
-        # make TTFO negative and get clamped to 0.
         self.record_output_timestamps(processed.request_outputs, output_ts=_time.time())
 
         if processed.reqs_to_abort:
@@ -1091,33 +1082,47 @@ class StagePool:
 
         return processed.request_outputs
 
-    async def poll_llm_raw_output(
-        self,
-        replica_id: int,
-        *,
-        timeout_s: float = 0.001,
-    ) -> EngineCoreOutputs | None:
-        """Poll raw EngineCore outputs from one LLM replica once."""
+    def _unwrap_llm_queue_item(self, outputs: Any) -> EngineCoreOutputs | None:
+        if isinstance(outputs, Exception):
+            raise outputs
+        if not outputs.outputs:
+            return None
+        return outputs
+
+    def try_poll_llm_raw_output_nowait(self, replica_id: int) -> EngineCoreOutputs | None:
+        """Non-blocking pull of one raw EngineCore output batch from a replica queue."""
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None
         client = cast(StagePoolLLMClient, raw_client)
         try:
-            return await asyncio.wait_for(
-                self._poll_stage_raw(client),
-                timeout=timeout_s,
-            )
-        except asyncio.TimeoutError:
+            outputs = client.outputs_queue.get_nowait()
+        except asyncio.QueueEmpty:
             return None
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
-                self.stage_id,
-                replica_id,
-            )
-            raise
+        return self._unwrap_llm_queue_item(outputs)
+
+    async def wait_llm_raw_output(self, replica_id: int) -> EngineCoreOutputs:
+        """Block until one raw EngineCore output batch is available on a replica queue."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            raise EngineDeadError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        client = cast(StagePoolLLMClient, raw_client)
+        outputs = await client.get_output_async()
+        raw_outputs = self._unwrap_llm_queue_item(outputs)
+        if raw_outputs is None:
+            return await self.wait_llm_raw_output(replica_id)
+        return raw_outputs
+
+    async def wait_diffusion_output(self, replica_id: int) -> Any:
+        """Block until one diffusion output is available on a replica queue."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            raise EngineDeadError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        client = cast(StagePoolDiffusionClient, raw_client)
+        output = client.get_diffusion_output_nowait()
+        if output is not None:
+            return output
+        return await client._output_queue.get()
 
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""

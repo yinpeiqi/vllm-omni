@@ -18,7 +18,7 @@
   │  │ • add_request() / add_request_async() -> input_processor.process_inputs() │  │
   │  │ • try_get_output() / try_get_output_async()                               │  │
   │  └───────────────────┬─────────────────────────────────▲─────────────────────┘  │
-  │         request_queue (janus.Queue)        output_queue (janus.Queue)           │
+  │    OrchestratorZmqClient (ZMQ ipc) ◄──────► OrchestratorZmqServer (ZMQ ipc)   │
   ├──────────────────────┼─────────────────────────────────┼────────────────────────┤
   │                      ▼        Orchestration Layer      │                        │
   │  ┌───────────────────────────────────────────────────────────────────────────┐  │
@@ -60,7 +60,7 @@
     -> (if stage-0 is llm and input is not EngineCoreRequest)
        InputProcessor.process_inputs()
        OutputProcessor[0].add_request()
-    -> request_queue.put(add_request_msg)
+    -> OrchestratorZmqClient.send(add_request_msg)
 
 [4] Orchestrator._request_handler
     -> _handle_add_request(msg)
@@ -75,7 +75,7 @@
     -> if finished and not final_stage and non-async-chunk:
          _forward_to_next_stage(...)
          -> next_stage.add_request_async(...)
-    -> output_queue.put(output)
+    -> OrchestratorZmqServer.send_output(output)
 
 [6] AsyncOmni._final_output_loop (background coroutine)
     -> AsyncOmniEngine.try_get_output_async()
@@ -106,7 +106,7 @@ sequenceDiagram
     AO->>AO: start output_handler once
     AO->>ENG: add_request(stage_id=0, ...)
     ENG->>ENG: input_processor.process_inputs()
-    ENG->>ORCH: request_queue.put(add_request)
+    ENG->>ORCH: ZMQ send(add_request)
 
     ORCH->>ORCH: _handle_add_request
     ORCH->>S0: add_request_async
@@ -117,7 +117,7 @@ sequenceDiagram
         alt need forward to next stage
             ORCH->>SN: add_request_async
         end
-        ORCH-->>ENG: output_queue.put
+        ORCH-->>ENG: ZMQ send_output
     end
 
     AO->>ENG: try_get_output_async
@@ -167,7 +167,7 @@ Current topology:
 │  │  │ generate()           │   │ final_output_handler()              │  │  │
 │  │  └──────────────────────┘   └─────────────────────────────────────┘  │  │
 │  └──────────────────────────────────────────────────────────────────────┘  │
-│         janus.Queue (request_queue) ▼  ▲ janus.Queue (output_queue)        │
+│   OrchestratorZmqClient (ZMQ ipc) ▼  ▲ OrchestratorZmqServer (ZMQ ipc)   │
 │  ┌──────────────────────────────────────────────────────────────────────┐  │
 │  │ Orchestrator Thread                                                  │  │
 │  │  ┌──────────────────────┐  ┌──────────────────────────────────────┐  │  │

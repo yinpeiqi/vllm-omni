@@ -2,7 +2,8 @@
 Async Omni Engine for vLLM-Omni multi-stage runtime.
 
 AsyncOmniEngine in the caller's thread is a thin proxy that communicates
-with the Orchestrator (running in a background thread) via janus queues.
+with the Orchestrator (running in a background thread or worker process)
+via ZMQ IPC.
 """
 
 from __future__ import annotations
@@ -11,7 +12,10 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import json
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -20,7 +24,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, Literal, cast
 
-import janus
 import torch
 from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
@@ -45,12 +48,25 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator_zmq_ipc import (
+    OrchestratorZmqClient,
+    OrchestratorZmqSender,
+    OrchestratorZmqServer,
+    cleanup_ipc_dir,
+    make_ipc_dir,
+    wait_ready,
+    write_worker_init,
+)
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
 )
 from vllm_omni.engine.stage_client import StageClient
-from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
+from vllm_omni.engine.stage_init_utils import (
+    build_stage0_input_processor,
+    build_vllm_config,
+    extract_stage_metadata,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
     StageRuntimeInfo,
@@ -64,8 +80,6 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
-_REQUEST_QUEUE_MAXSIZE = 256
-
 
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
@@ -157,16 +171,44 @@ def _apply_omni_final_stage_metadata(
     )
 
 
-def _weak_shutdown_async_omni_engine(
-    orchestrator_thread: threading.Thread | None,
-    request_queue: janus.Queue[EngineQueueMessage] | None,
-    output_queue: janus.Queue[EngineQueueMessage] | None,
-    rpc_output_queue: janus.Queue[EngineQueueMessage] | None,
+def _weak_shutdown_detached_worker(
+    worker_proc: subprocess.Popen[Any] | None,
+    ipc_client: OrchestratorZmqClient | None,
+    ipc_dir: str | None,
 ) -> None:
-    """Best-effort orchestrator cleanup for GC finalization."""
+    """Best-effort cleanup for a detached orchestrator worker."""
     try:
-        if request_queue is not None:
-            request_queue.sync_q.put_nowait(ShutdownRequestMessage())
+        if ipc_client is not None:
+            ipc_client.send(ShutdownRequestMessage())
+    except Exception:
+        pass
+
+    try:
+        if worker_proc is not None and worker_proc.poll() is None:
+            worker_proc.terminate()
+            worker_proc.wait(timeout=30)
+    except Exception:
+        pass
+
+    try:
+        if ipc_client is not None:
+            ipc_client.close()
+    except Exception:
+        pass
+
+    if ipc_dir is not None:
+        cleanup_ipc_dir(ipc_dir)
+
+
+def _weak_shutdown_inprocess(
+    orchestrator_thread: threading.Thread | None,
+    ipc_client: OrchestratorZmqClient | None,
+    ipc_dir: str | None,
+) -> None:
+    """Best-effort orchestrator cleanup for in-process mode."""
+    try:
+        if ipc_client is not None:
+            ipc_client.send(ShutdownRequestMessage())
     except Exception:
         pass
 
@@ -176,12 +218,14 @@ def _weak_shutdown_async_omni_engine(
     except Exception:
         pass
 
-    for q in (request_queue, output_queue, rpc_output_queue):
-        try:
-            if q is not None:
-                q.close()
-        except Exception:
-            pass
+    try:
+        if ipc_client is not None:
+            ipc_client.close()
+    except Exception:
+        pass
+
+    if ipc_dir is not None:
+        cleanup_ipc_dir(ipc_dir)
 
 
 class AsyncOmniEngine:
@@ -190,7 +234,7 @@ class AsyncOmniEngine:
     All stage clients, input/output processors, and stage-to-stage transfer
     logic live inside the Orchestrator coroutine (running in its own thread
     with a dedicated asyncio event loop). This class communicates with it
-    via janus queues (sync side for callers, async side for orchestrator).
+    via ZMQ IPC (``OrchestratorZmqClient`` / ``OrchestratorZmqServer``).
 
     Args:
         model: Model name or path
@@ -205,6 +249,10 @@ class AsyncOmniEngine:
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
     _enable_orch_monitor: bool = False
+    _detach_orchestrator: bool = False
+    _ipc_client: OrchestratorZmqClient | None = None
+    _worker_proc: subprocess.Popen[Any] | None = None
+    _ipc_dir: str | None = None
 
     def __init__(
         self,
@@ -235,6 +283,15 @@ class AsyncOmniEngine:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
+        detach_orchestrator = bool(kwargs.pop("detach_orchestrator", False))
+        if os.environ.get("VLLM_OMNI_ORCHESTRATOR_WORKER") == "1":
+            detach_orchestrator = False
+        self._detach_orchestrator = detach_orchestrator
+        self._detached_worker_extra_kwargs: dict[str, Any] = {
+            key: kwargs[key]
+            for key in ("stage_overrides", "deploy_config", "stage_configs_path")
+            if key in kwargs
+        }
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -285,45 +342,72 @@ class AsyncOmniEngine:
         self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[OmniSamplingParams] = []
         self.stage_metadata: list[StageRuntimeInfo] = []
-        # Janus queues are constructed eagerly here (not deferred to the
-        # orchestrator thread) so the master server's ROUTER thread always
-        # sees a non-None ``self.request_queue`` when on_register fires.
-        # ``async_q`` lazily binds to whatever event loop first awaits on
-        # it (the orchestrator loop), so cross-thread use stays correct.
-        self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
-        self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
-        self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
         self._running_counter = OmniRequestCounter()
+        self._ipc_client = None
+        self._worker_proc = None
+        self._ipc_dir: str | None = None
+        self.orchestrator_thread: threading.Thread | None = None
 
-        logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
+        is_worker = os.environ.get("VLLM_OMNI_ORCHESTRATOR_WORKER") == "1"
 
-        # Launch orchestrator background thread
-        startup_future: concurrent.futures.Future = concurrent.futures.Future()
-
-        self.orchestrator_thread = threading.Thread(
-            target=self._bootstrap_orchestrator,
-            args=(
-                stage_init_timeout,
-                startup_future,
-            ),
-            daemon=True,
-            name="orchestrator",
-        )
-        self.orchestrator_thread.start()
-        self._wait_for_orchestrator_init(startup_future, startup_timeout)
-
-        # Stage runtime fields are assigned directly on self by the bootstrap thread.
-        self._weak_finalizer = weakref.finalize(
-            self,
-            _weak_shutdown_async_omni_engine,
-            self.orchestrator_thread,
-            self.request_queue,
-            self.output_queue,
-            self.rpc_output_queue,
-        )
+        if self._detach_orchestrator:
+            logger.info(
+                "[AsyncOmniEngine] Launching detached orchestrator worker with %s stages",
+                self.num_stages,
+            )
+            self._spawn_detached_orchestrator(
+                stage_init_timeout=stage_init_timeout,
+                startup_timeout=startup_timeout,
+                diffusion_batch_size=diffusion_batch_size,
+                single_stage_mode=single_stage_mode,
+                log_stats=log_stats,
+                tokenizer=tokenizer,
+                worker_kwargs=kwargs,
+            )
+            self._weak_finalizer = weakref.finalize(
+                self,
+                _weak_shutdown_detached_worker,
+                self._worker_proc,
+                self._ipc_client,
+                self._ipc_dir,
+            )
+        elif is_worker:
+            self._ipc_dir = os.environ.get("VLLM_OMNI_ORCHESTRATOR_IPC_DIR")
+            if not self._ipc_dir:
+                raise RuntimeError("VLLM_OMNI_ORCHESTRATOR_IPC_DIR is required in orchestrator worker")
+            logger.info("[AsyncOmniEngine] Orchestrator worker IPC dir=%s", self._ipc_dir)
+            startup_future: concurrent.futures.Future = concurrent.futures.Future()
+            self.orchestrator_thread = threading.Thread(
+                target=self._bootstrap_orchestrator,
+                args=(stage_init_timeout, startup_future),
+                daemon=True,
+                name="orchestrator",
+            )
+            self.orchestrator_thread.start()
+            self._wait_for_orchestrator_init(startup_future, startup_timeout)
+        else:
+            logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
+            self._ipc_dir = make_ipc_dir()
+            startup_future = concurrent.futures.Future()
+            self.orchestrator_thread = threading.Thread(
+                target=self._bootstrap_orchestrator,
+                args=(stage_init_timeout, startup_future),
+                daemon=True,
+                name="orchestrator",
+            )
+            self.orchestrator_thread.start()
+            self._wait_for_orchestrator_init(startup_future, startup_timeout)
+            self._ipc_client = OrchestratorZmqClient(self._ipc_dir)
+            self._weak_finalizer = weakref.finalize(
+                self,
+                _weak_shutdown_inprocess,
+                self.orchestrator_thread,
+                self._ipc_client,
+                self._ipc_dir,
+            )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
@@ -341,7 +425,12 @@ class AsyncOmniEngine:
             self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
         return self._diffusion_od_config_view
 
-    def _initialize_stages(self, stage_init_timeout: int) -> None:
+    def _initialize_stages(
+        self,
+        stage_init_timeout: int,
+        *,
+        orchestrator_sender: Any | None = None,
+    ) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
         self._runtime = create_stage_runtime(
             stage_configs=self.stage_configs,
@@ -358,7 +447,7 @@ class AsyncOmniEngine:
             omni_dp_size_local=self._omni_dp_size_local,
             omni_heartbeat_timeout=self._omni_heartbeat_timeout,
             omni_lb_policy=self._omni_lb_policy,
-            request_queue=self.request_queue,
+            orchestrator_sender=orchestrator_sender,
         )
         self._runtime.initialize()
 
@@ -399,6 +488,97 @@ class AsyncOmniEngine:
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
+    def _init_client_only(self) -> None:
+        """Initialize APIServer-side metadata without launching stage workers."""
+        self.stage_pools = []
+        self.stage_clients = []
+        self.stage_vllm_configs = []
+        self.output_processors = []
+        self.prompt_expand_func = None
+
+        stage_metadata_list = [extract_stage_metadata(cfg) for cfg in self.stage_configs]
+
+        self.stage_vllm_configs = []
+        for cfg in self.stage_configs:
+            stage_vllm_config, _ = build_vllm_config(cfg, self.model)
+            self.stage_vllm_configs.append(stage_vllm_config)
+
+        if self.stage_vllm_configs:
+            self.input_processor = build_stage0_input_processor(self.stage_vllm_configs[0])
+        else:
+            self.input_processor = None
+
+        self.default_sampling_params_list = [meta.default_sampling_params for meta in stage_metadata_list]
+        self.stage_metadata = [
+            StageRuntimeInfo(
+                final_output=meta.final_output,
+                final_output_type=meta.final_output_type,
+                stage_type=meta.stage_type,
+                model_stage=meta.model_stage,
+            )
+            for meta in stage_metadata_list
+        ]
+        supported_tasks: set[str] = set()
+        if any(meta.is_comprehension for meta in stage_metadata_list):
+            supported_tasks.add("generate")
+        if any(meta.final_output_type == "audio" for meta in stage_metadata_list):
+            supported_tasks.add("speech")
+        self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+
+    def _spawn_detached_orchestrator(
+        self,
+        *,
+        stage_init_timeout: int,
+        startup_timeout: int,
+        diffusion_batch_size: int,
+        single_stage_mode: bool,
+        log_stats: bool,
+        tokenizer: str | None,
+        worker_kwargs: dict[str, Any],
+    ) -> None:
+        self._ipc_dir = make_ipc_dir()
+        payload = {
+            "stage_init_timeout": stage_init_timeout,
+            "init_timeout": startup_timeout,
+            "diffusion_batch_size": diffusion_batch_size,
+            "single_stage_mode": single_stage_mode,
+            "log_stats": log_stats,
+            "tokenizer": tokenizer,
+            "enable_orch_monitor": self._enable_orch_monitor,
+            **self._detached_worker_extra_kwargs,
+            **worker_kwargs,
+        }
+        payload.pop("detach_orchestrator", None)
+        write_worker_init(self._ipc_dir, self.model, payload)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "vllm_omni.engine.orchestrator_worker",
+            "--ipc-dir",
+            self._ipc_dir,
+        ]
+        logger.info("[AsyncOmniEngine] Spawning detached orchestrator worker: %s", " ".join(cmd))
+        self._worker_proc = subprocess.Popen(cmd, env=os.environ.copy())
+        try:
+            wait_ready(self._ipc_dir, float(startup_timeout))
+        except Exception:
+            self._try_shutdown("[AsyncOmniEngine] Detached orchestrator startup failed")
+            raise
+
+        if self._worker_proc.poll() is not None:
+            raise RuntimeError(
+                f"Detached orchestrator worker exited during startup with code {self._worker_proc.returncode}"
+            )
+
+        self._ipc_client = OrchestratorZmqClient(self._ipc_dir)
+        self._init_client_only()
+
+    def _send_to_orchestrator(self, msg: EngineQueueMessage) -> None:
+        if self._ipc_client is None:
+            raise RuntimeError("Orchestrator IPC client is not initialized")
+        self._ipc_client.send(msg)
+
     def _bootstrap_orchestrator(
         self,
         stage_init_timeout: int,
@@ -410,28 +590,34 @@ class AsyncOmniEngine:
         asyncio.set_event_loop(loop)
 
         async def _run_orchestrator() -> None:
-            self._initialize_stages(stage_init_timeout)
+            if not self._ipc_dir:
+                raise RuntimeError("Orchestrator IPC directory is not configured")
 
-            pd_config = self._detect_pd_config()
+            zmq_ipc = OrchestratorZmqServer(self._ipc_dir)
+            ipc_sender = OrchestratorZmqSender(self._ipc_dir)
+            try:
+                self._initialize_stages(stage_init_timeout, orchestrator_sender=ipc_sender.send)
 
-            membership_controller = self._runtime.create_membership_controller()
+                pd_config = self._detect_pd_config()
+                membership_controller = self._runtime.create_membership_controller()
 
-            orchestrator = Orchestrator(
-                request_async_queue=self.request_queue.async_q,
-                output_async_queue=self.output_queue.async_q,
-                rpc_async_queue=self.rpc_output_queue.async_q,
-                stage_pools=self.stage_pools,
-                async_chunk=self.async_chunk,
-                pd_config=pd_config,
-                membership_controller=membership_controller,
-                running_counter=self._running_counter,
-                transfer_emitter=self._transfer_emitter,
-                log_stats=self._log_stats,
-                enable_orch_monitor=self._enable_orch_monitor,
-            )
-            if not startup_future.done():
-                startup_future.set_result(asyncio.get_running_loop())
-            await orchestrator.run()
+                orchestrator = Orchestrator(
+                    zmq_ipc,
+                    stage_pools=self.stage_pools,
+                    async_chunk=self.async_chunk,
+                    pd_config=pd_config,
+                    membership_controller=membership_controller,
+                    running_counter=self._running_counter,
+                    transfer_emitter=self._transfer_emitter,
+                    log_stats=self._log_stats,
+                    enable_orch_monitor=self._enable_orch_monitor,
+                )
+                if not startup_future.done():
+                    startup_future.set_result(asyncio.get_running_loop())
+                await orchestrator.run()
+            finally:
+                ipc_sender.close()
+                zmq_ipc.close()
 
         try:
             loop.run_until_complete(_run_orchestrator())
@@ -441,15 +627,6 @@ class AsyncOmniEngine:
                 wrapped.__cause__ = e
                 startup_future.set_exception(wrapped)
             logger.exception("[AsyncOmniEngine] Orchestrator thread crashed")
-            error_text = str(e) or "Orchestrator thread crashed"
-            try:
-                error_msg = ErrorMessage(error=error_text, fatal=True)
-                if self.output_queue is not None:
-                    self.output_queue.sync_q.put_nowait(error_msg)
-                if self.rpc_output_queue is not None:
-                    self.rpc_output_queue.sync_q.put_nowait(error_msg)
-            except Exception:
-                pass
             raise
         finally:
             try:
@@ -804,7 +981,7 @@ class AsyncOmniEngine:
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
             # admission through StagePool.submit_initial(..., affinity_request_id=...).
-            self.request_queue.sync_q.put(
+            self._send_to_orchestrator(
                 AddCompanionRequestMessage(
                     companion_id=cid,
                     parent_id=parent_id,
@@ -1282,7 +1459,7 @@ class AsyncOmniEngine:
             reasoning_ended=reasoning_ended,
             resumable=resumable,
         )
-        self.request_queue.sync_q.put(msg)
+        self._send_to_orchestrator(msg)
 
         # CFG companion expansion: create and enqueue companion requests
         # so the AR stage also generates their KV caches.
@@ -1353,7 +1530,7 @@ class AsyncOmniEngine:
             resumable=resumable,
             message_type="streaming_update",
         )
-        self.request_queue.sync_q.put(msg)
+        self._send_to_orchestrator(msg)
 
     async def add_streaming_update_async(
         self,
@@ -1381,21 +1558,25 @@ class AsyncOmniEngine:
 
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
         """Read one output message from the Orchestrator output queue."""
-        try:
-            return self.output_queue.sync_q.get(timeout=timeout)
-        except queue.Empty:
-            if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-            return None
+        if self._ipc_client is None:
+            raise RuntimeError("Orchestrator IPC client is not initialized")
+        msg = self._ipc_client.recv_output(timeout=timeout)
+        if msg is not None:
+            return msg
+        if not self.is_alive():
+            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+        return None
 
     async def try_get_output_async(self) -> EngineQueueMessage | None:
         """Async read from the Orchestrator output queue."""
-        try:
-            return self.output_queue.sync_q.get_nowait()
-        except queue.Empty:
-            if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-            return None
+        if self._ipc_client is None:
+            raise RuntimeError("Orchestrator IPC client is not initialized")
+        msg = self._ipc_client.recv_output(timeout=0.001)
+        if msg is not None:
+            return msg
+        if not self.is_alive():
+            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+        return None
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""
@@ -1403,9 +1584,7 @@ class AsyncOmniEngine:
 
     def abort(self, request_ids: list[str]) -> None:
         """Send abort message to the Orchestrator."""
-        if self.request_queue is None:
-            raise RuntimeError("request_queue is not initialized")
-        self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
+        self._send_to_orchestrator(AbortRequestMessage(request_ids=request_ids))
 
     async def abort_async(self, request_ids: list[str]) -> None:
         """Async abort API."""
@@ -1435,13 +1614,15 @@ class AsyncOmniEngine:
         )
 
         with self._rpc_lock:
-            self.request_queue.sync_q.put(msg)
+            if self._ipc_client is None:
+                raise RuntimeError("Orchestrator IPC client is not initialized")
+            self._send_to_orchestrator(msg)
             deadline = None if timeout is None else time.monotonic() + timeout
 
             while True:
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
                 try:
-                    result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
+                    result_msg = self._ipc_client.recv_rpc(timeout=remaining)
                 except queue.Empty as exc:
                     raise TimeoutError(f"collective_rpc timed out after {timeout} seconds") from exc
 
@@ -1487,8 +1668,10 @@ class AsyncOmniEngine:
         )
 
     def is_alive(self) -> bool:
-        """Whether the orchestrator thread is alive."""
-        return bool(self.orchestrator_thread.is_alive())
+        """Whether the orchestrator thread or detached worker is alive."""
+        if self._detach_orchestrator:
+            return self._worker_proc is not None and self._worker_proc.poll() is None
+        return bool(self.orchestrator_thread is not None and self.orchestrator_thread.is_alive())
 
     def shutdown(self) -> None:
         """Send shutdown message and wait for the Orchestrator thread to exit."""
@@ -1500,22 +1683,52 @@ class AsyncOmniEngine:
             finalizer.detach()
 
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
-        if self.request_queue is not None:
-            self.request_queue.sync_q.put_nowait(ShutdownRequestMessage())
-        if self.is_alive():
-            self.orchestrator_thread.join()
+        if self._detach_orchestrator:
+            if self._ipc_client is not None:
+                try:
+                    self._ipc_client.send(ShutdownRequestMessage())
+                except Exception:
+                    pass
+            if self._worker_proc is not None:
+                try:
+                    self._worker_proc.wait(timeout=120)
+                except Exception:
+                    pass
+                if self._worker_proc.poll() is None:
+                    self._worker_proc.terminate()
+                    try:
+                        self._worker_proc.wait(timeout=30)
+                    except Exception:
+                        pass
+            if self._ipc_client is not None:
+                try:
+                    self._ipc_client.close()
+                except Exception:
+                    pass
+            if self._ipc_dir is not None:
+                cleanup_ipc_dir(self._ipc_dir)
+        else:
+            if self._ipc_client is not None:
+                try:
+                    self._ipc_client.send(ShutdownRequestMessage())
+                except Exception:
+                    pass
+            if self.is_alive() and self.orchestrator_thread is not None:
+                self.orchestrator_thread.join()
 
-        for q in (self.request_queue, self.output_queue, self.rpc_output_queue):
-            try:
-                q.close()
-            except Exception:
-                pass
+            if self._ipc_client is not None:
+                try:
+                    self._ipc_client.close()
+                except Exception:
+                    pass
+            if self._ipc_dir is not None:
+                cleanup_ipc_dir(self._ipc_dir)
 
-        if hasattr(self, "_runtime") and self._runtime is not None:
-            try:
-                self._runtime.shutdown()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to shutdown StageRuntime")
+            if hasattr(self, "_runtime") and self._runtime is not None:
+                try:
+                    self._runtime.shutdown()
+                except Exception:
+                    logger.exception("[AsyncOmniEngine] Failed to shutdown StageRuntime")
 
         # ── Release CuMem allocator memory pool ──────────────────────────────
         # When enable_sleep_mode is in use, the CuMem (CUDA Virtual Memory

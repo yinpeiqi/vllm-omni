@@ -4,8 +4,6 @@ Focuses on the critical behavior: when the orchestrator thread dies,
 subsequent attempts to collect output raise RuntimeError.
 """
 
-import queue
-
 import pytest
 from pytest_mock import MockerFixture
 
@@ -16,10 +14,10 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_engine(output_queue, mocker: MockerFixture, *, thread_alive: bool = True) -> AsyncOmniEngine:
+def _make_engine(ipc_client, mocker: MockerFixture, *, thread_alive: bool = True) -> AsyncOmniEngine:
     """Create an AsyncOmniEngine bypassing __init__."""
     engine = object.__new__(AsyncOmniEngine)
-    engine.output_queue = output_queue
+    engine._ipc_client = ipc_client
     engine.orchestrator_thread = mocker.MagicMock(
         is_alive=mocker.MagicMock(return_value=thread_alive),
     )
@@ -29,24 +27,21 @@ def _make_engine(output_queue, mocker: MockerFixture, *, thread_alive: bool = Tr
 def test_try_get_output_raises_after_orchestrator_dies(mocker: MockerFixture):
     """Draining remaining results then hitting an empty queue with a dead
     orchestrator must raise RuntimeError so callers know the pipeline is gone."""
-    mock_queue = mocker.MagicMock()
-    # First call succeeds; second call finds the queue empty.
-    mock_queue.sync_q.get.side_effect = [
+    mock_client = mocker.MagicMock()
+    mock_client.recv_output.side_effect = [
         OutputMessage(
             request_id="r1",
             stage_id=0,
             engine_outputs=OmniRequestOutput(request_id="r1"),
             finished=False,
         ),
-        queue.Empty,
+        None,
     ]
 
-    engine = _make_engine(mock_queue, mocker, thread_alive=True)
+    engine = _make_engine(mock_client, mocker, thread_alive=True)
 
-    # Collect the one buffered result.
     assert engine.try_get_output().request_id == "r1"
 
-    # Orchestrator thread crashes between polls.
     engine.orchestrator_thread.is_alive.return_value = False
 
     with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
@@ -56,18 +51,18 @@ def test_try_get_output_raises_after_orchestrator_dies(mocker: MockerFixture):
 @pytest.mark.asyncio
 async def test_try_get_output_async_raises_after_orchestrator_dies(mocker: MockerFixture):
     """Same scenario as above but for the async variant."""
-    mock_queue = mocker.MagicMock()
-    mock_queue.sync_q.get_nowait.side_effect = [
+    mock_client = mocker.MagicMock()
+    mock_client.recv_output.side_effect = [
         OutputMessage(
             request_id="r1",
             stage_id=0,
             engine_outputs=OmniRequestOutput(request_id="r1"),
             finished=False,
         ),
-        queue.Empty,
+        None,
     ]
 
-    engine = _make_engine(mock_queue, mocker, thread_alive=True)
+    engine = _make_engine(mock_client, mocker, thread_alive=True)
 
     assert (await engine.try_get_output_async()).request_id == "r1"
 
@@ -85,10 +80,10 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
     """
     fatal_msg = ErrorMessage(error="Orchestrator thread crashed", fatal=True)
 
-    mock_queue = mocker.MagicMock()
-    mock_queue.sync_q.get.return_value = fatal_msg
+    mock_client = mocker.MagicMock()
+    mock_client.recv_output.return_value = fatal_msg
 
-    engine = _make_engine(mock_queue, mocker, thread_alive=False)
+    engine = _make_engine(mock_client, mocker, thread_alive=False)
 
     msg = engine.try_get_output()
     assert msg is not None
@@ -102,10 +97,10 @@ async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker:
     """Async variant of the fatal error message test."""
     fatal_msg = ErrorMessage(error="Orchestrator thread crashed", fatal=True)
 
-    mock_queue = mocker.MagicMock()
-    mock_queue.sync_q.get_nowait.return_value = fatal_msg
+    mock_client = mocker.MagicMock()
+    mock_client.recv_output.return_value = fatal_msg
 
-    engine = _make_engine(mock_queue, mocker, thread_alive=False)
+    engine = _make_engine(mock_client, mocker, thread_alive=False)
 
     msg = await engine.try_get_output_async()
     assert msg is not None

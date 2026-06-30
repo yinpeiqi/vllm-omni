@@ -723,6 +723,14 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable orchestrator window monitor and write a JSON log at shutdown.",
         )
+        omni_config_group.add_argument(
+            "--detach-orchestrator",
+            action="store_true",
+            help=(
+                "Run orchestrator + stage workers in a separate process and "
+                "communicate with the API server over ZMQ IPC (experimental)."
+            ),
+        )
 
         # Supplementary auxiliary text encoder parameters
         # (e.g., the meta llama/meta llama-3.1-8b-instrument used by hidream)

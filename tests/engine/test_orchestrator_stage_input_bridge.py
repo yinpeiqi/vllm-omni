@@ -3,16 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import queue
 from types import SimpleNamespace
 from typing import Any
 
-import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator_zmq_ipc import OrchestratorZmqServer, cleanup_ipc_dir, make_ipc_dir
 from vllm_omni.engine.stage_pool import StagePool
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -38,16 +39,13 @@ class FakeStageClient:
         self.custom_process_input_func = None
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
-        self._engine_core_outputs = queue.Queue()
+        self.outputs_queue: asyncio.Queue[Any] = asyncio.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
 
     async def get_output_async(self):
-        try:
-            return self._engine_core_outputs.get_nowait()
-        except queue.Empty:
-            return SimpleNamespace(outputs=[])
+        return await self.outputs_queue.get()
 
     def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
         return list(self.next_inputs)
@@ -127,30 +125,31 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
         ),
     ]
-    request_q = janus.Queue()
-    output_q = janus.Queue()
-    rpc_q = janus.Queue()
-    orchestrator = Orchestrator(
-        request_async_queue=request_q.async_q,
-        output_async_queue=output_q.async_q,
-        rpc_async_queue=rpc_q.async_q,
-        stage_pools=stage_pools,
-        async_chunk=False,
-    )
-    input_processor = FakeInputProcessor()
-    orchestrator._stage_input_processors[1] = input_processor
-    req_state = OrchestratorRequestState(
-        request_id="req-text",
-        prompt={"prompt": "original"},
-        sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
-        final_stage_id=1,
-    )
+    ipc_dir = make_ipc_dir(prefix="test_orch_ipc_")
+    zmq_ipc = OrchestratorZmqServer(ipc_dir)
+    try:
+        orchestrator = Orchestrator(
+            zmq_ipc,
+            stage_pools=stage_pools,
+            async_chunk=False,
+        )
+        input_processor = FakeInputProcessor()
+        orchestrator._stage_input_processors[1] = input_processor
+        req_state = OrchestratorRequestState(
+            request_id="req-text",
+            prompt={"prompt": "original"},
+            sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
+            final_stage_id=1,
+        )
 
-    await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
+        await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
 
-    assert input_processor.calls
-    assert input_processor.calls[0]["prompt"] == {"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}
-    assert stage1.add_request_calls
-    submitted_request = stage1.add_request_calls[0][0]
-    assert submitted_request.prompt_token_ids == [101, 102]
-    assert submitted_request.external_req_id == "req-text"
+        assert input_processor.calls
+        assert input_processor.calls[0]["prompt"] == {"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}
+        assert stage1.add_request_calls
+        submitted_request = stage1.add_request_calls[0][0]
+        assert submitted_request.prompt_token_ids == [101, 102]
+        assert submitted_request.external_req_id == "req-text"
+    finally:
+        zmq_ipc.close()
+        cleanup_ipc_dir(ipc_dir)

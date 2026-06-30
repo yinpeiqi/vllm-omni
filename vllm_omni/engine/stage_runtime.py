@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-import janus
+from collections.abc import Callable
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
@@ -736,7 +736,7 @@ class DistStageRuntime(StageRuntime):
         omni_dp_size_local: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
-        request_queue: janus.Queue[EngineQueueMessage] | None = None,
+        orchestrator_sender: Callable[[EngineQueueMessage], None] | None = None,
     ) -> None:
         super().__init__(
             stage_configs=stage_configs,
@@ -752,7 +752,7 @@ class DistStageRuntime(StageRuntime):
         self._omni_master_port = omni_master_port
         self._omni_heartbeat_timeout = omni_heartbeat_timeout
         self._omni_lb_policy = omni_lb_policy
-        self._request_queue = request_queue
+        self._orchestrator_sender = orchestrator_sender
 
         self._omni_master_server: OmniMasterServer | None = None
         self._coordinator_runtime: Any | None = None
@@ -938,11 +938,11 @@ class DistStageRuntime(StageRuntime):
 
     def _dispatch_master_register(self, stage_id: int, replica_id: int, alloc: Any) -> None:
         """Callback from OmniMasterServer when a headless replica registers."""
-        if self._request_queue is None:
-            logger.warning("[DistStageRuntime] on_register fired but no request_queue wired")
+        if self._orchestrator_sender is None:
+            logger.warning("[DistStageRuntime] on_register fired but no orchestrator_sender wired")
             return
         try:
-            self._request_queue.sync_q.put_nowait(
+            self._orchestrator_sender(
                 RegisterRemoteReplicaMessage(stage_id=stage_id, replica_id=replica_id)
             )
         except Exception:
@@ -1073,7 +1073,7 @@ def create_stage_runtime(
     omni_dp_size_local: int = 1,
     omni_heartbeat_timeout: float = 30.0,
     omni_lb_policy: str = "random",
-    request_queue: janus.Queue[EngineQueueMessage] | None = None,
+    orchestrator_sender: Callable[[EngineQueueMessage], None] | None = None,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1093,7 +1093,7 @@ def create_stage_runtime(
             omni_dp_size_local=omni_dp_size_local,
             omni_heartbeat_timeout=omni_heartbeat_timeout,
             omni_lb_policy=omni_lb_policy,
-            request_queue=request_queue,
+            orchestrator_sender=orchestrator_sender,
         )
     return StageRuntime(
         stage_configs=stage_configs,

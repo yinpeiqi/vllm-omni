@@ -11,10 +11,13 @@ class ClientRequestState:
         request_id: str,
         external_request_id: str | None = None,
         queue: asyncio.Queue | None = None,
+        *,
+        final_output_stage_ids: set[int] | None = None,
     ):
         self.request_id = request_id
         self.external_request_id = external_request_id
         self.stage_id: int | None = None
+        self.final_output_stage_ids: set[int] = set(final_output_stage_ids or ())
         self.queue = queue if queue is not None else asyncio.Queue()
         self.metrics: OrchestratorAggregator | None = None
         # Wall-clock time at which the user's request arrived in the engine

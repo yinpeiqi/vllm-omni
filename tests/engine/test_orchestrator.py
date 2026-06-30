@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -30,6 +29,12 @@ from vllm_omni.engine.orchestrator import (
     _build_terminal_empty_output,
     _infer_stage_audio_sample_rate,
 )
+from vllm_omni.engine.orchestrator_zmq_ipc import (
+    OrchestratorZmqClient,
+    OrchestratorZmqServer,
+    cleanup_ipc_dir,
+    make_ipc_dir,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -40,9 +45,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @dataclass
 class OrchestratorFixture:
     orchestrator: Orchestrator
-    request_sync_q: Any
-    output_sync_q: Any
-    queues: tuple[janus.Queue, ...]
+    ipc_client: OrchestratorZmqClient
+    ipc_dir: str
     thread: threading.Thread
     result_future: concurrent.futures.Future[None]
 
@@ -77,22 +81,35 @@ class FakeStageClient:
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
-        self._engine_core_outputs = queue.Queue()
-        self._diffusion_outputs = queue.Queue()
+        # Thread-safe queues: tests push from pytest thread, orch reads in its loop.
+        self.outputs_queue: queue.Queue[Any] = queue.Queue()
+        self._output_queue: queue.Queue[Any] = queue.Queue()
 
     # Orchestrator-facing interface.
     async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
 
     async def get_output_async(self):
-        try:
-            return self._engine_core_outputs.get_nowait()
-        except queue.Empty:
-            return SimpleNamespace(outputs=[])
+        while True:
+            try:
+                outputs = self.outputs_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.001)
+                continue
+            if isinstance(outputs, Exception):
+                raise outputs
+            return outputs
+
+    async def get_diffusion_output_async(self):
+        while True:
+            try:
+                return self._output_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.001)
 
     def get_diffusion_output_nowait(self):
         try:
-            return self._diffusion_outputs.get_nowait()
+            return self._output_queue.get_nowait()
         except queue.Empty:
             return None
 
@@ -134,10 +151,10 @@ class FakeStageClient:
 
     # Test helpers for seeding fake stage outputs.
     def push_engine_core_outputs(self, outputs) -> None:
-        self._engine_core_outputs.put_nowait(outputs)
+        self.outputs_queue.put_nowait(outputs)
 
     def push_diffusion_output(self, output) -> None:
-        self._diffusion_outputs.put_nowait(output)
+        self._output_queue.put_nowait(output)
 
 
 def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
@@ -194,6 +211,22 @@ class FakeOutputProcessor:
 
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None
+
+
+class SequenceOutputProcessor(FakeOutputProcessor):
+    """Return one canned request output per ``process_outputs`` call."""
+
+    def __init__(self, *, request_outputs: list[object]) -> None:
+        super().__init__(request_outputs=request_outputs)
+        self._next_index = 0
+
+    def process_outputs(self, *_args, **_kwargs):
+        index = min(self._next_index, len(self.request_outputs) - 1)
+        self._next_index += 1
+        return SimpleNamespace(
+            request_outputs=[self.request_outputs[index]],
+            reqs_to_abort=[],
+        )
 
 
 def _sampling_params(max_tokens: int = 4) -> SamplingParams:
@@ -288,7 +321,7 @@ def _build_harness(
             stage_vllm_configs=stage_vllm_configs,
         )
 
-    ready_future: concurrent.futures.Future[tuple[Orchestrator, janus.Queue, janus.Queue, janus.Queue]] = (
+    ready_future: concurrent.futures.Future[tuple[Orchestrator, str, OrchestratorZmqClient]] = (
         concurrent.futures.Future()
     )
     result_future: concurrent.futures.Future[None] = concurrent.futures.Future()
@@ -298,18 +331,20 @@ def _build_harness(
         asyncio.set_event_loop(loop)
 
         async def _run() -> None:
-            request_queue = janus.Queue()
-            output_queue = janus.Queue()
-            rpc_queue = janus.Queue()
+            ipc_dir = make_ipc_dir(prefix="test_orch_ipc_")
+            zmq_ipc = OrchestratorZmqServer(ipc_dir)
+            ipc_client = OrchestratorZmqClient(ipc_dir)
             orchestrator = Orchestrator(
-                request_async_queue=request_queue.async_q,
-                output_async_queue=output_queue.async_q,
-                rpc_async_queue=rpc_queue.async_q,
+                zmq_ipc,
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,
             )
-            ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
-            await orchestrator.run()
+            ready_future.set_result((orchestrator, ipc_dir, ipc_client))
+            try:
+                await orchestrator.run()
+            finally:
+                zmq_ipc.close()
+                cleanup_ipc_dir(ipc_dir)
 
         try:
             loop.run_until_complete(_run())
@@ -331,19 +366,18 @@ def _build_harness(
     thread = threading.Thread(target=_runner, daemon=True, name="test-orchestrator")
     thread.start()
 
-    orchestrator, request_queue, output_queue, rpc_queue = ready_future.result(timeout=5)
+    orchestrator, ipc_dir, ipc_client = ready_future.result(timeout=5)
     return OrchestratorFixture(
         orchestrator=orchestrator,
-        request_sync_q=request_queue.sync_q,
-        output_sync_q=output_queue.sync_q,
-        queues=(request_queue, output_queue, rpc_queue),
+        ipc_client=ipc_client,
+        ipc_dir=ipc_dir,
         thread=thread,
         result_future=result_future,
     )
 
 
 async def _shutdown_orchestrator(orchestrator_fixture: OrchestratorFixture) -> None:
-    orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+    orchestrator_fixture.ipc_client.send(ShutdownRequestMessage())
     await asyncio.to_thread(orchestrator_fixture.thread.join, 5)
     if orchestrator_fixture.thread.is_alive():
         raise AssertionError("Timed out waiting for orchestrator thread shutdown")
@@ -364,8 +398,10 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
         if time.monotonic() >= deadline:
             raise AssertionError("Timed out waiting for orchestrator output")
         try:
-            msg = orchestrator_fixture.output_sync_q.get_nowait()
-        except queue.Empty:
+            msg = orchestrator_fixture.ipc_client.recv_output(timeout=0.001)
+        except Exception:
+            msg = None
+        if msg is None:
             await asyncio.sleep(0.01)
             continue
         if isinstance(msg, OutputMessage):
@@ -378,12 +414,11 @@ async def _get_rpc_message(
     timeout: float = 2.0,
 ) -> CollectiveRPCResultMessage:
     deadline = time.monotonic() + timeout
-    rpc_sync_q = orchestrator_fixture.queues[2].sync_q
     while True:
         if time.monotonic() >= deadline:
             raise AssertionError("Timed out waiting for orchestrator rpc output")
         try:
-            return rpc_sync_q.get_nowait()
+            return orchestrator_fixture.ipc_client.recv_rpc(timeout=0.05)
         except queue.Empty:
             await asyncio.sleep(0.01)
 
@@ -396,8 +431,9 @@ async def _enqueue_add_request(
     original_prompt,
     sampling_params_list,
     final_stage_id: int,
+    final_output_stage_ids: list[int] | None = None,
 ) -> None:
-    orchestrator_fixture.request_sync_q.put_nowait(
+    orchestrator_fixture.ipc_client.send(
         StageSubmissionMessage(
             type="add_request",
             request_id=request_id,
@@ -406,6 +442,7 @@ async def _enqueue_add_request(
             output_prompt_text=None,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
@@ -414,7 +451,7 @@ async def _enqueue_add_request(
 
 
 async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, request_ids: list[str]) -> None:
-    orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=request_ids))
+    orchestrator_fixture.ipc_client.send(AbortRequestMessage(request_ids=request_ids))
 
 
 @pytest.fixture
@@ -430,10 +467,16 @@ def orchestrator_factory():
 
     for fixture in fixtures:
         if fixture.thread.is_alive():
-            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            try:
+                fixture.ipc_client.send(ShutdownRequestMessage())
+            except Exception:
+                pass
             fixture.thread.join(timeout=5)
-        for q in fixture.queues:
-            q.close()
+        try:
+            fixture.ipc_client.close()
+        except Exception:
+            pass
+        cleanup_ipc_dir(fixture.ipc_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -568,8 +611,10 @@ async def test_run_single_stage_diffusion_streaming_forwards_intermediate_chunks
                     f"Timed out waiting for finished orchestrator output, got {len(output_msgs)} message(s)"
                 )
             try:
-                msg = orchestrator_fixture.output_sync_q.get_nowait()
-            except queue.Empty:
+                msg = orchestrator_fixture.ipc_client.recv_output(timeout=0.001)
+            except Exception:
+                msg = None
+            if msg is None:
                 await asyncio.sleep(0.01)
                 continue
             if isinstance(msg, OutputMessage):
@@ -671,6 +716,40 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         assert output_msg.stage_id == 1
         assert output_msg.finished is True
         assert "req-async" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_audio_only_request_skips_non_requested_final_output_stage(orchestrator_factory) -> None:
+    """Audio-only clients should not receive thinker text over the output channel."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text")
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    processors = [
+        SequenceOutputProcessor(
+            request_outputs=[_build_request_output("req-audio-only", token_ids=[1], finished=False)]
+        ),
+        FakeOutputProcessor(request_outputs=[]),
+    ]
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
+    request = SimpleNamespace(request_id="req-audio-only", prompt_token_ids=[1, 2, 3])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-audio-only",
+            prompt=request,
+            original_prompt={"prompt": "hello audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            final_output_stage_ids=[1],
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-partial", 1.0))
+
+        with pytest.raises(AssertionError, match="Timed out waiting for orchestrator output"):
+            await _get_output_message(orchestrator_fixture, timeout=0.2)
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
@@ -795,6 +874,64 @@ async def test_multi_replica_round_robin_distribution(orchestrator_factory) -> N
         assert output_msg.stage_id == 1
         assert output_msg.finished is True
         assert "req-0" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_multi_replica_stage_outputs_all_forwarded(orchestrator_factory) -> None:
+    """When multiple replica queues wake in one wait window, none may be dropped."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7, 8]}],
+    )
+
+    proc0 = SequenceOutputProcessor(
+        request_outputs=[
+            _build_request_output("req-0", token_ids=[3], finished=True),
+            _build_request_output("req-1", token_ids=[4], finished=True),
+        ]
+    )
+    proc1 = FakeOutputProcessor(request_outputs=[_build_request_output("req-0", token_ids=[10], finished=True)])
+
+    default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1], [stage1]],
+        output_processors=[proc0, proc1],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-0",
+            prompt=SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "hello 0"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
+
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-1",
+            prompt=SimpleNamespace(request_id="req-1", prompt_token_ids=[5, 6]),
+            original_prompt={"prompt": "hello 1"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
+
+        stage0_r0.push_engine_core_outputs(_engine_core_outputs("s0r0-raw", 1.0))
+        stage0_r1.push_engine_core_outputs(_engine_core_outputs("s0r1-raw", 1.1))
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 2, timeout=5.0)
+        forwarded_ids = {call[0].request_id for call in stage1.add_request_calls}
+        assert forwarded_ids == {"req-0", "req-1"}
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
@@ -1064,7 +1201,7 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
         prev_level = target_logger.level
         target_logger.setLevel(logging.WARNING)
         try:
-            orchestrator_fixture.request_sync_q.put_nowait(
+            orchestrator_fixture.ipc_client.send(
                 CollectiveRPCRequestMessage(
                     rpc_id="rpc-1",
                     method="list_loras",
@@ -1126,7 +1263,7 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         )
         await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
 
-        orchestrator_fixture.request_sync_q.put_nowait(
+        orchestrator_fixture.ipc_client.send(
             AddCompanionRequestMessage(
                 companion_id="parent-neg",
                 parent_id="parent",
@@ -1145,6 +1282,70 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_drain_replica_once_drains_multiple_batches_until_empty() -> None:
+    poll_calls = 0
+
+    class BatchPool:
+        stage_type = "llm"
+
+        def try_poll_llm_raw_output_nowait(self, replica_id: int):
+            nonlocal poll_calls
+            poll_calls += 1
+            if poll_calls <= 3:
+                return SimpleNamespace(outputs=[SimpleNamespace(request_id="req-0")], scheduler_stats=None)
+            return None
+
+        async def process_llm_raw_outputs(self, *args, **kwargs):
+            return []
+
+    pool = BatchPool()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._shutdown_event = asyncio.Event()
+    orchestrator._stat_logger = None
+    orchestrator._stage_replica_to_engine_idx = {}
+    orchestrator.request_states = {}
+    orchestrator.stage_pools = [pool]
+
+    async def _noop_kv_ready(*args, **kwargs) -> None:
+        return None
+
+    async def _noop_handle_processed(*args, **kwargs) -> None:
+        return None
+
+    orchestrator._handle_kv_ready_raw_outputs = _noop_kv_ready
+    orchestrator._handle_processed_outputs = _noop_handle_processed
+
+    handled = await orchestrator._drain_replica_once(0, pool, 0)
+
+    assert handled is True
+    assert poll_calls == 4
+
+
+def test_iter_drain_replicas_prefers_deeper_queues() -> None:
+    class QueueDepthPool:
+        def __init__(self, *, final_output: bool, depths: dict[int, int]) -> None:
+            self.final_output = final_output
+            self.stage_type = "llm"
+            self._depths = depths
+
+        def live_replica_ids(self):
+            return sorted(self._depths)
+
+        def replica_outputs_queue_size(self, replica_id: int) -> int:
+            return self._depths[replica_id]
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        QueueDepthPool(final_output=False, depths={0: 10, 1: 50}),
+        QueueDepthPool(final_output=True, depths={0: 5, 1: 20}),
+    ]
+
+    order = [(stage_id, replica_id) for stage_id, _pool, replica_id in orchestrator._iter_drain_replicas()]
+
+    assert order == [(1, 1), (1, 0), (0, 1), (0, 0)]
 
 
 def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:

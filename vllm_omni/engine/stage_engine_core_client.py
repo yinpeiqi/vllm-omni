@@ -6,6 +6,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import socket

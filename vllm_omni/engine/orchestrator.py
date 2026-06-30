@@ -16,7 +16,6 @@ import time as _time
 from dataclasses import dataclass, field
 from typing import Any
 
-import janus
 import torch
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
@@ -45,6 +44,7 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
+from vllm_omni.engine.orchestrator_zmq_ipc import OrchestratorZmqServer
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -52,6 +52,9 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+# Max EngineCore output batches drained per replica per orchestrator loop pass.
+_DRAIN_MAX_BATCHES_PER_REPLICA = 64
 
 
 def _build_terminal_empty_output(
@@ -211,9 +214,7 @@ class Orchestrator:
 
     def __init__(
         self,
-        request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[dict[str, Any]],
-        rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
+        zmq_ipc: OrchestratorZmqServer,
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
@@ -224,9 +225,7 @@ class Orchestrator:
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
     ) -> None:
-        self.request_async_queue = request_async_queue
-        self.output_async_queue = output_async_queue
-        self.rpc_async_queue = rpc_async_queue
+        self._zmq_ipc = zmq_ipc
 
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
@@ -261,6 +260,21 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+    async def _recv_request_message(self) -> EngineQueueMessage:
+        return await self._zmq_ipc.recv_request()
+
+    async def _recv_request_message_nowait(self) -> EngineQueueMessage | None:
+        return await self._zmq_ipc.recv_request_nowait()
+
+    async def _send_output_message(self, msg: EngineQueueMessage) -> None:
+        await self._zmq_ipc.send_output(msg)
+
+    async def _send_rpc_message(self, msg: EngineQueueMessage) -> None:
+        await self._zmq_ipc.send_rpc(msg)
+
+    def _output_channel(self) -> Any:
+        return self._zmq_ipc.output_queue
 
     def _init_metrics_state(
         self,
@@ -341,7 +355,7 @@ class Orchestrator:
         membership_watcher: asyncio.Task[None] | None = None
         if self._membership is not None:
             self._membership.install_unregister_handlers(
-                output_queue=self.output_async_queue,
+                output_queue=self._output_channel(),
                 cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
             )
             membership_watcher = self._membership.start()
@@ -396,7 +410,7 @@ class Orchestrator:
     async def _request_handler(self) -> None:
         """Read messages from the main thread via request_async_queue."""
         while True:
-            msg = await self.request_async_queue.get()
+            msg = await self._recv_request_message()
             msg_type = msg.type
 
             if msg_type == "add_request":
@@ -629,7 +643,7 @@ class Orchestrator:
                 stage_ids.append(pool.stage_id)
                 results.append(stage_result)
 
-        await self.rpc_async_queue.put(
+        await self._send_rpc_message(
             CollectiveRPCResultMessage(
                 rpc_id=rpc_id,
                 method=method,
@@ -656,111 +670,252 @@ class Orchestrator:
             logger.debug("[Orchestrator] _orchestration_output_handler cancelled")
             return
 
-    async def _orchestration_loop(self) -> None:
-        """Poll stage pools and route logical outputs."""
-        while not self._shutdown_event.is_set():
-            idle = True
-            for stage_id in range(self.num_stages):
-                pool = self.stage_pools[stage_id]
-                for replica_id in pool.live_replica_ids():
-                    if self._shutdown_event.is_set():
-                        return
+    def _iter_live_replicas(self):
+        for stage_id, pool in enumerate(self.stage_pools):
+            for replica_id in pool.live_replica_ids():
+                yield stage_id, pool, replica_id
 
-                    if pool.stage_type == "diffusion":
-                        output = pool.poll_diffusion_output(replica_id)
-                        if output is None:
-                            continue
+    def _iter_drain_replicas(self):
+        """Yield replicas with final outputs first, deepest MP queues first."""
+        final_entries: list[tuple[int, int, int, StagePool]] = []
+        upstream_entries: list[tuple[int, int, int, StagePool]] = []
+        for stage_id, pool in enumerate(self.stage_pools):
+            bucket = final_entries if pool.final_output else upstream_entries
+            for replica_id in pool.live_replica_ids():
+                depth = pool.replica_outputs_queue_size(replica_id)
+                bucket.append((-depth, stage_id, replica_id, pool))
+        final_entries.sort()
+        upstream_entries.sort()
+        for _, stage_id, replica_id, pool in final_entries:
+            yield stage_id, pool, replica_id
+        for _, stage_id, replica_id, pool in upstream_entries:
+            yield stage_id, pool, replica_id
 
-                        pool.record_output_timestamps([output])
-                        await self._handle_processed_outputs(stage_id, replica_id, [output])
-                        idle = False
-                    else:
-                        try:
-                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
-                            if raw_outputs is None:
-                                continue
+    async def _process_llm_raw_poll_result(
+        self,
+        stage_id: int,
+        replica_id: int,
+        raw_outputs: EngineCoreOutputs,
+    ) -> None:
+        """Process one raw LLM poll result and route processed outputs."""
+        pool = self.stage_pools[stage_id]
+        await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+        for eco in raw_outputs.outputs:
+            req_state = self.request_states.get(getattr(eco, "request_id", None))
+            if req_state is None or not req_state.streaming.enabled:
+                continue
+            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+            req_state.streaming.new_prompt_len_snapshot = getattr(
+                eco,
+                "new_prompt_len_snapshot",
+                None,
+            )
+            await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+        record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+        iteration_stats = IterationStats() if record_stats else None
+        raw_output = await pool.process_llm_raw_outputs(
+            replica_id,
+            raw_outputs,
+            iteration_stats=iteration_stats,
+        )
+        if record_stats:
+            self._stat_logger.record(
+                raw_outputs.scheduler_stats,
+                iteration_stats,
+                engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+            )
+        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
 
-                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-                            for eco in raw_outputs.outputs:
-                                req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
-                                    continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
-                                if req_state.streaming.enabled:
-                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
-                            # OmniSchedulerMixin.make_stats() already throttles
-                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
-                            # being non-None means this replica passed its own gate.
-                            # A second global throttle here would drop stats for
-                            # other (stage, replica) pairs in the same 1s window.
-                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
-                            iteration_stats = IterationStats() if record_stats else None
-                            raw_output = await pool.process_llm_raw_outputs(
-                                replica_id,
-                                raw_outputs,
-                                iteration_stats=iteration_stats,
-                            )
-                            if record_stats:
-                                self._stat_logger.record(
-                                    raw_outputs.scheduler_stats,
-                                    iteration_stats,
-                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
-                                )
-                        except asyncio.CancelledError:
-                            raise
-                        except EngineDeadError as e:
-                            logger.error(
-                                "[Orchestrator] Stage-%s is dead: %s",
-                                stage_id,
-                                e,
-                            )
-                            # TODO: Fault handling is intentionally fail-stop at
-                            # the orchestrator level today. If one replica in a
-                            # logical stage dies, we promote it to `_fatal_error`,
-                            # notify requests already admitted to that stage, and
-                            # re-raise so `run()` shuts down all stages. This is
-                            # conservative but means a single unhealthy replica in
-                            # a multi-replica deployment can take down otherwise
-                            # healthy replicas in other stages. Revisit this when
-                            # adding per-replica fault isolation / eviction.
-                            self._fatal_error = str(e)
-                            self._fatal_error_stage_id = stage_id
-                            for req_id, req_state in list(self.request_states.items()):
-                                if stage_id in req_state.stage_submit_ts:
-                                    await self.output_async_queue.put(
-                                        ErrorMessage(
-                                            error=str(e),
-                                            fatal=True,
-                                            request_id=req_id,
-                                            stage_id=stage_id,
-                                        )
-                                    )
-                                    self.request_states.pop(req_id, None)
-                            self._shutdown_event.set()
-                            raise
-                        except Exception:
-                            if self._shutdown_event.is_set():
-                                return
-                            logger.exception(
-                                "[Orchestrator] Stage-%s replica-%s processing failed",
-                                stage_id,
-                                replica_id,
-                            )
-                            raise
+    async def _try_process_llm_raw_poll_result(
+        self,
+        stage_id: int,
+        replica_id: int,
+        raw_outputs: EngineCoreOutputs,
+    ) -> None:
+        try:
+            await self._process_llm_raw_poll_result(stage_id, replica_id, raw_outputs)
+        except asyncio.CancelledError:
+            raise
+        except EngineDeadError as exc:
+            await self._handle_llm_stage_dead(stage_id, exc)
+        except Exception:
+            if self._shutdown_event.is_set():
+                return
+            logger.exception(
+                "[Orchestrator] Stage-%s replica-%s processing failed",
+                stage_id,
+                replica_id,
+            )
+            raise
 
-                        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
-                        idle = False
+    async def _handle_llm_stage_dead(self, stage_id: int, exc: EngineDeadError) -> None:
+        logger.error("[Orchestrator] Stage-%s is dead: %s", stage_id, exc)
+        self._fatal_error = str(exc)
+        self._fatal_error_stage_id = stage_id
+        for req_id, req_state in list(self.request_states.items()):
+            if stage_id in req_state.stage_submit_ts:
+                await self._send_output_message(
+                    ErrorMessage(
+                        error=str(exc),
+                        fatal=True,
+                        request_id=req_id,
+                        stage_id=stage_id,
+                    )
+                )
+                self.request_states.pop(req_id, None)
+        self._shutdown_event.set()
+        raise exc
 
-            self._orch_monitor.note_loop(idle=idle)
-            if idle:
-                await asyncio.sleep(0.001)
+    async def _drain_one_llm_batch(
+        self,
+        stage_id: int,
+        pool: StagePool,
+        replica_id: int,
+    ) -> bool:
+        """Non-blocking pull of one raw LLM batch. Returns True if handled."""
+        try:
+            raw_outputs = pool.try_poll_llm_raw_output_nowait(replica_id)
+        except EngineDeadError as exc:
+            await self._handle_llm_stage_dead(stage_id, exc)
+        if raw_outputs is None:
+            return False
+        await self._try_process_llm_raw_poll_result(stage_id, replica_id, raw_outputs)
+        return True
+
+    async def _drain_one_diffusion_batch(
+        self,
+        stage_id: int,
+        pool: StagePool,
+        replica_id: int,
+    ) -> bool:
+        """Non-blocking pull of one diffusion output. Returns True if handled."""
+        output = pool.poll_diffusion_output(replica_id)
+        if output is None:
+            return False
+        pool.record_output_timestamps([output])
+        await self._handle_processed_outputs(stage_id, replica_id, [output])
+        return True
+
+    async def _drain_replica_once(
+        self,
+        stage_id: int,
+        pool: StagePool,
+        replica_id: int,
+    ) -> bool:
+        """Drain up to ``_DRAIN_MAX_BATCHES_PER_REPLICA`` batches without blocking."""
+        handled_any = False
+        drain_batch = (
+            self._drain_one_diffusion_batch
+            if pool.stage_type == "diffusion"
+            else self._drain_one_llm_batch
+        )
+        for _ in range(_DRAIN_MAX_BATCHES_PER_REPLICA):
+            if self._shutdown_event.is_set():
+                break
+            if not await drain_batch(stage_id, pool, replica_id):
+                break
+            handled_any = True
+        return handled_any
+
+    async def _drain_available_stage_outputs(self) -> bool:
+        """Batch-drain every replica queue without blocking."""
+        found = False
+        for stage_id, pool, replica_id in self._iter_drain_replicas():
+            if self._shutdown_event.is_set():
+                return found
+            if await self._drain_replica_once(stage_id, pool, replica_id):
+                found = True
+        return found
+
+    async def _wait_any_stage_output(self) -> list[tuple[int, int, str, Any]] | None:
+        """Block until any live replica has output ready.
+
+        Returns every replica wait task that completed in the same wakeup
+        window. ``asyncio.wait(FIRST_COMPLETED)`` may mark multiple tasks done
+        when several queues receive output in one event-loop tick; each done
+        task has already consumed its queue item and must be processed.
+        """
+        wait_tasks: dict[asyncio.Task[Any], tuple[int, int, str]] = {}
+        for stage_id, pool, replica_id in self._iter_live_replicas():
+            if pool.stage_type == "diffusion":
+                task = asyncio.create_task(
+                    pool.wait_diffusion_output(replica_id),
+                    name=f"wait-diffusion-s{stage_id}-r{replica_id}",
+                )
             else:
+                task = asyncio.create_task(
+                    pool.wait_llm_raw_output(replica_id),
+                    name=f"wait-llm-s{stage_id}-r{replica_id}",
+                )
+            wait_tasks[task] = (stage_id, replica_id, pool.stage_type)
+
+        if not wait_tasks:
+            return None
+
+        shutdown_task = asyncio.create_task(self._shutdown_event.wait(), name="wait-orch-shutdown")
+        try:
+            done, pending = await asyncio.wait(
+                set(wait_tasks) | {shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_task in done:
+                return None
+
+            wakes: list[tuple[int, int, str, Any]] = []
+            for task in done:
+                if task not in wait_tasks:
+                    continue
+                stage_id, replica_id, stage_type = wait_tasks[task]
+                try:
+                    payload = task.result()
+                except EngineDeadError as exc:
+                    payload = exc
+                wakes.append((stage_id, replica_id, stage_type, payload))
+
+            return wakes or None
+        finally:
+            shutdown_task.cancel()
+            for task in wait_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*wait_tasks, shutdown_task, return_exceptions=True)
+
+    async def _process_stage_wake(
+        self,
+        stage_id: int,
+        replica_id: int,
+        stage_type: str,
+        payload: Any,
+    ) -> None:
+        """Route one stage output consumed by a wait/drain wakeup."""
+        if isinstance(payload, EngineDeadError):
+            await self._handle_llm_stage_dead(stage_id, payload)
+        if stage_type == "diffusion":
+            pool = self.stage_pools[stage_id]
+            pool.record_output_timestamps([payload])
+            await self._handle_processed_outputs(stage_id, replica_id, [payload])
+            return
+
+        await self._try_process_llm_raw_poll_result(stage_id, replica_id, payload)
+
+    async def _orchestration_loop(self) -> None:
+        """Event-driven stage output loop with batch drain."""
+        while not self._shutdown_event.is_set():
+            if await self._drain_available_stage_outputs():
+                self._orch_monitor.note_loop(idle=False)
                 await asyncio.sleep(0)
+                continue
+
+            self._orch_monitor.note_loop(idle=True)
+
+            wakes = await self._wait_any_stage_output()
+            if not wakes:
+                continue
+
+            self._orch_monitor.note_loop(idle=False)
+            for stage_id, replica_id, stage_type, payload in wakes:
+                await self._process_stage_wake(stage_id, replica_id, stage_type, payload)
+            await asyncio.sleep(0)
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
@@ -799,7 +954,7 @@ class Orchestrator:
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
             parent_id = output.request_id
-        await self.output_async_queue.put(
+        await self._send_output_message(
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
@@ -895,12 +1050,14 @@ class Orchestrator:
             return
 
         request_finished = False
+        final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
         if finished and self.stage_pools[stage_id].final_output:
             req_state.finished_final_output_stage_ids.add(stage_id)
-            final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
-        if self.stage_pools[stage_id].final_output:
-            await self.output_async_queue.put(
+        # Only stream stages the client asked for (e.g. audio-only should not
+        # flood ZMQ with thinker text deltas that the API layer would discard).
+        if self.stage_pools[stage_id].final_output and stage_id in final_output_stage_ids:
+            await self._send_output_message(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -912,7 +1069,7 @@ class Orchestrator:
                 )
             )
         elif stage_metrics is not None:
-            await self.output_async_queue.put(
+            await self._send_output_message(
                 StageMetricsMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -1274,7 +1431,7 @@ class Orchestrator:
                             src_stage_id,
                             next_logical,
                         )
-                        await self.output_async_queue.put(
+                        await self._send_output_message(
                             OutputMessage(
                                 request_id=req_id,
                                 stage_id=next_logical,
@@ -1416,7 +1573,7 @@ class Orchestrator:
                 final_output_type or "text",
                 final_stage_id,
             )
-            await self.output_async_queue.put(
+            await self._send_output_message(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,
@@ -1597,13 +1754,12 @@ class Orchestrator:
 
         # 1) Drain pending messages from the request queue.
         while True:
-            try:
-                msg = self.request_async_queue.get_nowait()
-            except Exception:
+            msg = await self._recv_request_message_nowait()
+            if msg is None:
                 break
             if msg.type == "add_request":
                 req_id = msg.request_id
-                await self.output_async_queue.put(
+                await self._send_output_message(
                     ErrorMessage(
                         error=self._fatal_error,
                         fatal=True,
@@ -1618,7 +1774,7 @@ class Orchestrator:
         #    missed it because it wasn't submitted to the dead stage yet).
         for req_id in list(self.request_states):
             if req_id not in notified:
-                await self.output_async_queue.put(
+                await self._send_output_message(
                     ErrorMessage(
                         error=self._fatal_error,
                         fatal=True,

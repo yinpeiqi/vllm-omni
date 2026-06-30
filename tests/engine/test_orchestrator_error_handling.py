@@ -45,9 +45,13 @@ async def _get_any_output_message(fixture: OrchestratorFixture, *, timeout: floa
         if time.monotonic() >= deadline:
             raise AssertionError("Timed out waiting for orchestrator output")
         try:
-            return fixture.output_sync_q.get_nowait()
-        except queue.Empty:
+            msg = fixture.ipc_client.recv_output(timeout=0.01)
+        except Exception:
+            msg = None
+        if msg is None:
             await asyncio.sleep(0.01)
+            continue
+        return msg
 
 
 @pytest.fixture
@@ -63,10 +67,18 @@ def orchestrator_factory():
 
     for fixture in fixtures:
         if fixture.thread.is_alive():
-            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            try:
+                fixture.ipc_client.send(ShutdownRequestMessage())
+            except Exception:
+                pass
             fixture.thread.join(timeout=5)
-        for q in fixture.queues:
-            q.close()
+        try:
+            fixture.ipc_client.close()
+        except Exception:
+            pass
+        from vllm_omni.engine.orchestrator_zmq_ipc import cleanup_ipc_dir
+
+        cleanup_ipc_dir(fixture.ipc_dir)
 
 
 # ───────── EngineDeadError from LLM stage poll ─────────
@@ -76,6 +88,8 @@ class FakeDeadLLMStageClient(FakeStageClient):
     """LLM stage client that raises EngineDeadError on get_output_async."""
 
     async def get_output_async(self):
+        while not self.add_request_calls:
+            await asyncio.sleep(0.001)
         raise EngineDeadError("Stage-0 engine core is dead")
 
 
@@ -116,7 +130,7 @@ async def test_engine_dead_error_broadcasts_fatal_and_shuts_down(orchestrator_fa
         assert "req-dead" not in orchestrator_fixture.orchestrator.request_states
     finally:
         if orchestrator_fixture.thread.is_alive():
-            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.ipc_client.send(ShutdownRequestMessage())
             orchestrator_fixture.thread.join(timeout=5)
 
 
@@ -159,7 +173,7 @@ async def test_diffusion_error_output_routed_as_finished(orchestrator_factory) -
         # Request state should be cleaned up.
         await _wait_for(lambda: "req-err" not in orchestrator_fixture.orchestrator.request_states)
     finally:
-        orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        orchestrator_fixture.ipc_client.send(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
 
 
@@ -208,7 +222,7 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
         # Request state should be cleaned up.
         await _wait_for(lambda: "req-blocked" not in orchestrator_fixture.orchestrator.request_states)
     finally:
-        orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        orchestrator_fixture.ipc_client.send(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
 
 
@@ -269,5 +283,5 @@ async def test_diffusion_client_error_output_propagates_non_400_status(
         # Request state should be cleaned up.
         await _wait_for(lambda: "req-blocked" not in orchestrator_fixture.orchestrator.request_states)
     finally:
-        orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        orchestrator_fixture.ipc_client.send(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
